@@ -291,8 +291,9 @@
                                                                   class="flex-shrink-0 text-[9px] font-medium text-neutral-400 bg-neutral-100 px-1.5 py-0.5 rounded-full"
                                                                   x-text="tool.param_count + (tool.param_count === 1 ? ' param' : ' params')"></span>
                                                         </div>
-                                                        <p x-show="tool.description" x-cloak
-                                                           class="text-[11px] text-neutral-500 mt-1 line-clamp-2" x-text="tool.description"></p>
+                                                        <div x-show="tool.description" x-cloak
+                                                             class="mcp-tool-desc mt-1"
+                                                             x-html="mcpMd(tool.description)"></div>
                                                     </div>
                                                 </template>
                                             </div>
