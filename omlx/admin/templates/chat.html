@@ -1476,7 +1476,7 @@
                             messages: messagesForApi,
                             stream: true,
                             stream_options: { include_usage: true },
-                            ...(this.mcpTools.length > 0 && { tools: this.mcpTools })
+                            execute_mcp_tools: true
                         }),
                         signal: this.abortController.signal
                     });
