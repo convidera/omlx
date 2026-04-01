@@ -126,6 +126,9 @@ def validate_config(data: Dict[str, Any]) -> MCPConfig:
             if isinstance(server_data, dict):
                 server_data = server_data.copy()
                 server_data["name"] = name
+                # Strip documentation-only keys that start with '_'
+                for key in [k for k in list(server_data) if k.startswith("_")]:
+                    server_data.pop(key)
                 # Parse optional 'auth' block into MCPAuthConfig
                 auth_raw = server_data.pop("auth", None)
                 if auth_raw is not None:
@@ -186,13 +189,30 @@ def create_example_config() -> str:
                 "enabled": True
             },
             "notion": {
+                "_comment": (
+                    "Option A: Notion internal integration token (most common). "
+                    "Get your token at https://www.notion.so/profile/integrations"
+                ),
+                "transport": "streamable-http",
+                "url": "https://mcp.notion.com/mcp",
+                "headers": {
+                    "Authorization": "Bearer YOUR_NOTION_INTEGRATION_TOKEN"
+                },
+                "enabled": False,
+                "timeout": 60,
+            },
+            "notion-oauth": {
+                "_comment": (
+                    "Option B: Notion public OAuth app "
+                    "- requires a registered OAuth application with client_id"
+                ),
                 "transport": "streamable-http",
                 "url": "https://mcp.notion.com/mcp",
                 "enabled": False,
                 "timeout": 60,
                 "auth": {
                     "type": "oauth2",
-                    "client_id": "YOUR_NOTION_CLIENT_ID",
+                    "client_id": "YOUR_NOTION_OAUTH_CLIENT_ID",
                     "auth_url": "https://api.notion.com/v1/oauth/authorize",
                     "token_url": "https://api.notion.com/v1/oauth/token",
                     "scopes": ["read_content", "update_content"]
