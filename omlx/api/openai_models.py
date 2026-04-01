@@ -369,6 +369,7 @@ class ChatCompletionChunkDelta(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[dict]] = None
+    tool_call_event: Optional[dict] = None
 
 
 class ChatCompletionChunkChoice(BaseModel):

@@ -1909,7 +1909,8 @@ async def create_chat_completion(
     # Log incoming request summary at debug, message content at trace
     logger.debug(f"Chat completion request received: model={request.model}, "
                  f"messages={len(request.messages)}, stream={request.stream}, "
-                 f"max_tokens={request.max_tokens}, temp={request.temperature}")
+                 f"max_tokens={request.max_tokens}, temp={request.temperature}, "
+                 f"execute_mcp_tools={request.execute_mcp_tools}")
     if logger.isEnabledFor(5):
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
@@ -2876,6 +2877,32 @@ async def stream_chat_completion(
 
             tool_calls_dicts = [tc.model_dump() for tc in tool_calls]
             tool_result_msgs = await _server_state.mcp_executor.execute_and_format(tool_calls_dicts)
+
+            # Emit tool_call_event chunks so the UI can display each call + result
+            for tc_dict, result_msg in zip(tool_calls_dicts, tool_result_msgs):
+                args = tc_dict.get("function", {}).get("arguments", "{}")
+                if isinstance(args, dict):
+                    args_str = json.dumps(args)
+                else:
+                    args_str = args or "{}"
+                result_content = result_msg.get("content", "")
+                if isinstance(result_content, (dict, list)):
+                    result_content = json.dumps(result_content)
+                event_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            tool_call_event={
+                                "name": tc_dict.get("function", {}).get("name", ""),
+                                "arguments": args_str,
+                                "result": str(result_content),
+                            }
+                        ),
+                        finish_reason=None,
+                    )],
+                )
+                yield f"data: {event_chunk.model_dump_json(exclude_none=True)}\n\n"
 
             # Append assistant turn with tool calls
             assistant_dict: dict = {

@@ -251,6 +251,63 @@
     .thinking-markdown pre { font-size: 0.75rem; }
     .thinking-content.collapsed { display: none; }
 
+    /* Tool use container */
+    .tooluse-container {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        margin: 0.5em 0;
+        overflow: hidden;
+    }
+    .tooluse-header {
+        display: flex;
+        align-items: center;
+        padding: 0.5rem 0.75rem;
+        cursor: pointer;
+        font-size: 0.75rem;
+        color: var(--text-tertiary);
+        gap: 0.5rem;
+        background: var(--bg-secondary);
+        border-bottom: 1px solid var(--border-faint);
+    }
+    .tooluse-header:hover { background: var(--bg-tertiary); }
+    .tooluse-icon { width: 14px; height: 14px; flex-shrink: 0; }
+    .tooluse-name { flex: 1; font-weight: 500; font-family: monospace; font-size: 0.75rem; }
+    .tooluse-toggle {
+        width: 14px;
+        height: 14px;
+        transition: transform 0.2s ease;
+        transform: rotate(180deg);
+    }
+    .tooluse-toggle.collapsed { transform: rotate(0deg); }
+    .tooluse-body {
+        padding: 0.75rem 1rem;
+        font-size: 0.8rem;
+        background: var(--bg-secondary);
+    }
+    .tooluse-body.collapsed { display: none; }
+    .tooluse-section { margin-bottom: 0.5rem; }
+    .tooluse-section:last-child { margin-bottom: 0; }
+    .tooluse-section-label {
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        margin-bottom: 0.25rem;
+    }
+    .tooluse-code {
+        background: var(--bg-tertiary);
+        border-radius: 0.375rem;
+        padding: 0.5rem;
+        font-family: monospace;
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+        white-space: pre-wrap;
+        word-break: break-all;
+        max-height: 200px;
+        overflow-y: auto;
+    }
+
     /* Input area */
     .input-container {
         border: 1px solid var(--border-normal);
@@ -1518,32 +1575,17 @@
                                         continue;
                                     }
 
-                                    // Accumulate streaming tool_call chunks
-                                    if (delta?.tool_calls) {
-                                        if (!firstToken) { firstToken = true; this.stopPrefillPolling(); }
-                                        for (const tc of delta.tool_calls) {
-                                            const i = tc.index ?? 0;
-                                            if (!toolCallsMap[i]) toolCallsMap[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
-                                            if (tc.id) toolCallsMap[i].id = tc.id;
-                                            if (tc.function?.name) toolCallsMap[i].function.name += tc.function.name;
-                                            if (tc.function?.arguments) toolCallsMap[i].function.arguments += tc.function.arguments;
-                                        }
-                                        // Clear any thinking content so it doesn't show as response text
-                                        // Also reset thinking state so the close tag isn't appended later
-                                        if (this.streamingContent) {
-                                            this.streamingContent = '';
+                                    if (delta?.tool_call_event) {
+                                        // Close any open thinking block before showing tool use
+                                        if (this.thinkingState.isInThinking) {
+                                            const elapsed = Date.now() - this.thinkingState.thinkingStartTime;
+                                            this.streamingContent += `</think data-elapsed="${elapsed}">`;
                                             this.thinkingState.isInThinking = false;
-                                            this.thinkingState.thinkingStartTime = null;
                                         }
-                                        // Update live status
-                                        const names = Object.values(toolCallsMap).map(t => t.function.name).filter(Boolean);
-                                        if (names.length > 0) {
-                                            const unique = [...new Set(names)];
-                                            const liveLabel = names.length > 3
-                                                ? `Calling ${unique.slice(0, 2).join(', ')} +${names.length - 2} more`
-                                                : `Calling ${names.join(', ')}`;
-                                            this.engineStatus = { text: liveLabel, icon: 'wrench' };
-                                        }
+                                        // Embed tool call as a self-contained tag
+                                        this.streamingContent += `<tooluse>${JSON.stringify(delta.tool_call_event)}</tooluse>`;
+                                        this.updateStreamingDOM();
+                                        this.scrollToBottom();
                                     }
 
                                     if (delta?.reasoning_content) {
@@ -1980,41 +2022,97 @@
                 }
             },
 
-            // Render markdown for streaming content (pure HTML generator, no side effects)
-            renderStreamingMarkdown(text) {
-                if (!text) return '';
+            extractToolUse(text) {
+                const toolUseRegex = /<tooluse>([\s\S]*?)<\/tooluse>/g;
+                const toolUseBlocks = [];
+                let cleanText = text;
+                let match;
+                while ((match = toolUseRegex.exec(text)) !== null) {
+                    try {
+                        toolUseBlocks.push(JSON.parse(match[1]));
+                    } catch(e) {}
+                }
+                cleanText = text.replace(toolUseRegex, '').trim();
+                return { toolUseBlocks, cleanText };
+            },
 
-                try {
-                    let html = '';
-                    let remaining = text;
+            renderToolUseBlock(data, index, messageId) {
+                const uniqueId = `${messageId || Date.now()}_tool_${index}`;
+                let argsFormatted = data.arguments || '{}';
+                try { argsFormatted = JSON.stringify(JSON.parse(argsFormatted), null, 2); } catch(e) {}
+                const resultFormatted = data.result || '';
 
-                    // Process complete think blocks first
-                    const completeThinkRegex = /<think>([\s\S]*?)<\/think(?:\s+data-elapsed="(\d+)")?>/g;
-                    let lastIndex = 0;
-                    let match;
-                    let blockIndex = 0;
+                const resultSection = resultFormatted.trim() ? `
+                    <div class="tooluse-section">
+                        <div class="tooluse-section-label">Result</div>
+                        <div class="tooluse-code">${this.escapeHtml(resultFormatted)}</div>
+                    </div>` : '';
 
-                    while ((match = completeThinkRegex.exec(text)) !== null) {
-                        const beforeContent = text.substring(lastIndex, match.index);
-                        if (beforeContent.trim()) {
-                            html += DOMPurify.sanitize(marked.parse(beforeContent));
-                        }
-                        const elapsed = match[2] ? parseInt(match[2]) : null;
-                        html += this.renderThinkingBlock(match[1].trim(), blockIndex++, 'streaming', elapsed);
-                        lastIndex = match.index + match[0].length;
+                return `
+                    <div class="tooluse-container">
+                        <div class="tooluse-header" onclick="document.getElementById('tooluse-body-${uniqueId}').classList.toggle('collapsed'); document.getElementById('tooluse-toggle-${uniqueId}').classList.toggle('collapsed');">
+                            <svg class="tooluse-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <rect x="2" y="5" width="16" height="12" rx="2" stroke="currentColor" stroke-width="1.5"/>
+                                <path d="M6 5V4a2 2 0 0 1 4 0v1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                                <path d="M7 10h6M7 13h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                            </svg>
+                            <span class="tooluse-name">${this.escapeHtml(data.name || 'tool')}</span>
+                            <svg class="tooluse-toggle" id="tooluse-toggle-${uniqueId}" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </div>
+                        <div class="tooluse-body collapsed" id="tooluse-body-${uniqueId}">
+                            <div class="tooluse-section">
+                                <div class="tooluse-section-label">Arguments</div>
+                                <div class="tooluse-code">${this.escapeHtml(argsFormatted)}</div>
+                            </div>
+                            ${resultSection}
+                        </div>
+                    </div>
+                `;
+            },
+
+            // Process text sequentially, rendering <think> and <tooluse> blocks in document order
+            _renderSequential(text, messageId, streaming) {
+                let html = '';
+                let remaining = text;
+                let lastIndex = 0;
+                let thinkIndex = 0;
+                let toolIndex = 0;
+
+                // Unified regex: match either a complete <think> or a complete <tooluse> block
+                const blockRegex = /<(think|tooluse)>([\s\S]*?)<\/(?:think(?:\s+data-elapsed="(\d+)")?|tooluse)>/g;
+                let match;
+
+                while ((match = blockRegex.exec(text)) !== null) {
+                    // Render plain text before this block
+                    const before = text.substring(lastIndex, match.index);
+                    if (before.trim()) {
+                        html += DOMPurify.sanitize(marked.parse(before));
                     }
 
-                    remaining = text.substring(lastIndex);
+                    if (match[1] === 'think') {
+                        const elapsed = match[3] ? parseInt(match[3]) : null;
+                        html += this.renderThinkingBlock(match[2].trim(), thinkIndex++, messageId, elapsed);
+                    } else {
+                        try {
+                            html += this.renderToolUseBlock(JSON.parse(match[2]), toolIndex++, messageId);
+                        } catch(e) {}
+                    }
+                    lastIndex = match.index + match[0].length;
+                }
 
+                remaining = text.substring(lastIndex);
+
+                if (streaming) {
+                    // Handle incomplete <think> block at the end (streaming only)
                     const incompleteThinkIndex = remaining.indexOf('<think>');
                     if (incompleteThinkIndex !== -1) {
                         const beforeIncomplete = remaining.substring(0, incompleteThinkIndex);
                         if (beforeIncomplete.trim()) {
                             html += DOMPurify.sanitize(marked.parse(beforeIncomplete));
                         }
-
                         const thinkingContent = remaining.substring(incompleteThinkIndex + 7);
-
                         html += `
                             <div class="thinking-container" id="streaming-thinking-container">
                                 <div class="thinking-header" onclick="this.parentElement.querySelector('.thinking-content').classList.toggle('collapsed');">
@@ -2029,60 +2127,146 @@
                                 </div>
                             </div>
                         `;
-                    } else if (remaining.trim()) {
-                        html += DOMPurify.sanitize(marked.parse(remaining));
+                        return html;
                     }
+                }
 
+                if (remaining.trim()) {
+                    html += DOMPurify.sanitize(marked.parse(remaining));
+                }
+                return html;
+            },
+
+            renderMarkdown(text) {
+                if (!text) return '';
+                try {
+                    const messageTimestamp = Date.now();
+                    const html = this._renderSequential(text, messageTimestamp, false);
+                    this.$nextTick(() => {
+                        this.addCodeCopyButtons();
+                        this.renderMath();
+                    });
                     return html;
                 } catch (e) {
                     return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
                 }
             },
 
-            // Efficiently update streaming DOM without destroying thinking container
+            // Render markdown for streaming content (pure HTML generator, no side effects)
+            renderStreamingMarkdown(text) {
+                if (!text) return '';
+                try {
+                    return this._renderSequential(text, 'streaming', true);
+                } catch (e) {
+                    return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }
+            },
+
+            // Incrementally update streaming DOM — never destroys already-rendered nodes
             updateStreamingDOM() {
                 const container = this.$refs.streamingOutput;
                 if (!container) return;
 
                 if (!this.streamingContent) {
                     container.innerHTML = '';
-                    this.resetStreamRenderState();
+                    container._streamState = null;
                     return;
                 }
 
+                // State stored on the element to stay outside Alpine reactivity
+                if (!container._streamState) {
+                    container._streamState = { endIndex: 0, thinkCount: 0, toolCount: 0 };
+                }
+                const state = container._streamState;
                 const text = this.streamingContent;
 
-                if (text.includes('<think>')) {
-                    container.innerHTML = this.renderStreamingMarkdown(text);
+                // Scan forward from last stable boundary for newly completed blocks
+                const blockRegex = /<(think|tooluse)>([\s\S]*?)<\/(?:think(?:\s+data-elapsed="(\d+)")?|tooluse)>/g;
+                blockRegex.lastIndex = state.endIndex;
+                let match;
 
+                while ((match = blockRegex.exec(text)) !== null) {
+                    // Remove transient tail elements before appending stable nodes
+                    container.querySelector('#streaming-thinking-container')?.remove();
+                    container.querySelector('#streaming-tail')?.remove();
+
+                    // Render any plain text between last stable boundary and this block
+                    const before = text.substring(state.endIndex, match.index);
+                    if (before.trim()) {
+                        const div = document.createElement('div');
+                        div.className = 'streaming-stable';
+                        div.innerHTML = DOMPurify.sanitize(marked.parse(before));
+                        container.appendChild(div);
+                    }
+
+                    // Append the completed block as a permanent stable node
+                    const blockDiv = document.createElement('div');
+                    blockDiv.className = 'streaming-stable';
+                    if (match[1] === 'think') {
+                        const elapsed = match[3] ? parseInt(match[3]) : null;
+                        blockDiv.innerHTML = this.renderThinkingBlock(match[2].trim(), state.thinkCount++, 'stable', elapsed);
+                    } else {
+                        try {
+                            blockDiv.innerHTML = this.renderToolUseBlock(JSON.parse(match[2]), state.toolCount++, 'stable');
+                        } catch(e) {}
+                    }
+                    container.appendChild(blockDiv);
+                    state.endIndex = match.index + match[0].length;
+                }
+
+                // Render the tail (content after last stable block)
+                const remaining = text.substring(state.endIndex);
+                const incompleteThinkIdx = remaining.indexOf('<think>');
+
+                if (incompleteThinkIdx !== -1) {
+                    // Inside an incomplete <think> block — fast-path update its text
+                    const thinkingText = remaining.substring(incompleteThinkIdx + 7);
+                    const existingContent = container.querySelector('#streaming-thinking-content');
+                    if (existingContent) {
+                        existingContent.innerHTML = this.escapeHtml(thinkingText).replace(/\n/g, '<br>');
+                    } else {
+                        const beforeThink = remaining.substring(0, incompleteThinkIdx);
+                        if (beforeThink.trim()) {
+                            const div = document.createElement('div');
+                            div.className = 'streaming-stable';
+                            div.innerHTML = DOMPurify.sanitize(marked.parse(beforeThink));
+                            container.appendChild(div);
+                        }
+                        const thinkDiv = document.createElement('div');
+                        thinkDiv.id = 'streaming-thinking-container';
+                        thinkDiv.className = 'thinking-container';
+                        thinkDiv.innerHTML = `
+                            <div class="thinking-header" onclick="this.parentElement.querySelector('.thinking-content').classList.toggle('collapsed');">
+                                <svg class="thinking-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <circle cx="10" cy="10" r="9" stroke="currentColor" stroke-width="1.5"/>
+                                    <path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                                </svg>
+                                <span class="thinking-text">Thinking...</span>
+                            </div>
+                            <div class="thinking-content" id="streaming-thinking-content">
+                                ${this.escapeHtml(thinkingText).replace(/\n/g, '<br>')}
+                            </div>
+                        `;
+                        container.appendChild(thinkDiv);
+                    }
+                    this.scrollThinkingContent();
+                } else if (remaining.trim()) {
+                    // Regular streaming text at the end
+                    let tailEl = container.querySelector('#streaming-tail');
+                    if (!tailEl) {
+                        container.querySelector('#streaming-thinking-container')?.remove();
+                        tailEl = document.createElement('div');
+                        tailEl.id = 'streaming-tail';
+                        container.appendChild(tailEl);
+                    }
+                    tailEl.innerHTML = DOMPurify.sanitize(marked.parse(remaining));
                     this.$nextTick(() => {
-                        this.addCodeCopyButtons(container);
-                        this.renderMathInRoot(container);
-                        this.scrollToBottom();
+                        this.addCodeCopyButtons();
+                        this.renderMath();
                     });
-                    return;
                 }
 
-                const { stableRoot, tailRoot } = this.ensureStreamingRoots(container);
-                const cutoff = this.findStableRenderCutoff(text);
-                const safeCutoff = Math.max(cutoff, this.streamRenderState.stableIndex);
-
-                if (safeCutoff > this.streamRenderState.stableIndex) {
-                    this.streamRenderState.stableText = text.slice(0, safeCutoff);
-                    stableRoot.innerHTML = this.streamRenderState.stableText
-                        ? DOMPurify.sanitize(marked.parse(this.streamRenderState.stableText))
-                        : '';
-                    this.addCodeCopyButtons(stableRoot);
-                    this.renderMathInRoot(stableRoot);
-                    this.streamRenderState.stableIndex = safeCutoff;
-                }
-
-                const tailText = text.slice(this.streamRenderState.stableIndex);
-                tailRoot.innerHTML = tailText ? DOMPurify.sanitize(marked.parse(tailText)) : '';
-
-                this.$nextTick(() => {
-                    this.scrollToBottom();
-                });
+                this.scrollToBottom();
             },
 
             ensureStreamingRoots(container) {
