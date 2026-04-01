@@ -356,6 +356,8 @@
             mcpActionLoading: {},  // { serverName: 'reconnect'|'auth'|'logout' }
             mcpMessages: {},       // { serverName: { type: 'error'|'ok', text: '...' } }
             mcpExpandedServer: null,
+            mcpReloading: false,
+            mcpReloadMessage: null,
             mcpShowConfigEditor: false,
             mcpConfigJson: '',
             mcpConfigSaving: false,
@@ -536,6 +538,26 @@
             // ------------------------------------------------------------------
             // MCP server management
             // ------------------------------------------------------------------
+
+            async mcpReloadConfig() {
+                this.mcpReloading = true;
+                this.mcpReloadMessage = null;
+                try {
+                    const resp = await fetch('/admin/api/mcp/reload', { method: 'POST' });
+                    const data = await resp.json();
+                    if (!resp.ok) throw new Error(data.detail || 'Reload failed');
+                    this.mcpReloadMessage = {
+                        type: 'ok',
+                        text: `Config reloaded — ${data.servers} server(s), ${data.tools} tool(s)`,
+                    };
+                    await this.loadMcpServers();
+                } catch (e) {
+                    this.mcpReloadMessage = { type: 'error', text: e.message };
+                } finally {
+                    this.mcpReloading = false;
+                    setTimeout(() => { this.mcpReloadMessage = null; }, 5000);
+                }
+            },
 
             async loadMcpServers() {
                 this.mcpLoading = true;

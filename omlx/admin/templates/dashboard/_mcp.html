@@ -12,15 +12,25 @@
                         </div>
                         <div class="flex items-center gap-2 flex-shrink-0">
                             <button @click="loadMcpServers()"
-                                    :disabled="mcpLoading"
+                                    :disabled="mcpLoading || mcpReloading"
                                     class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50">
-                                <!-- Inline spinner — never use :class on data-lucide elements -->
                                 <svg x-show="mcpLoading" class="animate-spin w-3.5 h-3.5 flex-shrink-0" viewBox="0 0 24 24" fill="none">
                                     <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
                                     <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
                                 </svg>
                                 <span x-show="!mcpLoading"><i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i></span>
                                 <span x-text="mcpLoading ? 'Refreshing…' : 'Refresh'"></span>
+                            </button>
+                            <button @click="mcpReloadConfig()"
+                                    :disabled="mcpReloading || mcpLoading"
+                                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all disabled:opacity-50"
+                                    title="Stop current MCP connections, reload config from disk, and reconnect">
+                                <svg x-show="mcpReloading" class="animate-spin w-3.5 h-3.5 flex-shrink-0" viewBox="0 0 24 24" fill="none">
+                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                                </svg>
+                                <span x-show="!mcpReloading"><i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i></span>
+                                <span x-text="mcpReloading ? 'Reloading…' : 'Reload Config'"></span>
                             </button>
                             <button @click="mcpShowConfigEditor = !mcpShowConfigEditor; if (mcpShowConfigEditor && !mcpConfigJson) loadMcpConfig()"
                                     :class="mcpShowConfigEditor ? 'bg-neutral-900 text-white' : 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'"
@@ -29,6 +39,17 @@
                                 Config
                             </button>
                         </div>
+                    </div>
+
+                    <!-- Reload result banner -->
+                    <div x-show="mcpReloadMessage" x-cloak
+                         class="mb-4 px-4 py-3 rounded-xl text-sm flex items-center gap-2"
+                         :class="mcpReloadMessage?.type === 'error'
+                             ? 'bg-red-50 border border-red-200 text-red-700'
+                             : 'bg-green-50 border border-green-200 text-green-700'">
+                        <span x-show="mcpReloadMessage?.type === 'error'"><i data-lucide="alert-circle" class="w-4 h-4 flex-shrink-0"></i></span>
+                        <span x-show="mcpReloadMessage?.type !== 'error'"><i data-lucide="check-circle" class="w-4 h-4 flex-shrink-0"></i></span>
+                        <span x-text="mcpReloadMessage?.text"></span>
                     </div>
 
                     <!-- MCP Not Available Notice -->
