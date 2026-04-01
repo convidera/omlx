@@ -21,6 +21,12 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 
+def _is_auth_failure(exc: Exception) -> bool:
+    """Return True when *exc* represents an HTTP 401 / unauthorized error."""
+    msg = str(exc).lower()
+    return "401" in msg or "unauthorized" in msg
+
+
 class MCPClient:
     """
     Client for connecting to a single MCP server.
@@ -67,6 +73,18 @@ class MCPClient:
 
     def get_status(self) -> MCPServerStatus:
         """Get server status."""
+        auth_state: Optional[str] = None
+        if self.config.auth:
+            from .oauth import MCPOAuthManager  # lazy import
+            manager = MCPOAuthManager()
+            info = manager.get_token_info(self.name)
+            if info is None:
+                auth_state = "not_authenticated"
+            elif info.get("is_expired"):
+                auth_state = "token_expired"
+            else:
+                auth_state = "authenticated"
+
         return MCPServerStatus(
             name=self.name,
             state=self._state,
@@ -74,11 +92,16 @@ class MCPClient:
             tools_count=len(self._tools),
             error=self._error,
             last_connected=self._last_connected,
+            auth_state=auth_state,
         )
 
     async def connect(self) -> bool:
         """
         Connect to the MCP server.
+
+        For HTTP-based transports configured with OAuth, the client will
+        attempt to acquire / refresh a token before connecting and retry
+        once if the server returns a 401.
 
         Returns:
             True if connection successful, False otherwise
@@ -95,35 +118,116 @@ class MCPClient:
             self._error = None
 
             try:
-                if self.config.transport == MCPTransport.STDIO:
-                    await self._connect_stdio()
-                elif self.config.transport == MCPTransport.SSE:
-                    await self._connect_sse()
-                elif self.config.transport == MCPTransport.STREAMABLE_HTTP:
-                    await self._connect_streamable_http()
+                # Eagerly fetch a stored / refreshed token for HTTP transports.
+                if self.config.auth and self.config.transport in (
+                    MCPTransport.SSE,
+                    MCPTransport.STREAMABLE_HTTP,
+                ):
+                    token = await self._get_oauth_token()
+                    if token:
+                        self._inject_auth_header(token)
+
+                await self._do_connect()
+
+            except Exception as first_exc:
+                # On auth failure, try to obtain a fresh token and retry once.
+                if self.config.auth and _is_auth_failure(first_exc):
+                    logger.info(
+                        f"MCP server '{self.name}' returned 401; "
+                        "attempting to refresh auth token and retry"
+                    )
+                    try:
+                        token = await self._get_oauth_token(force_refresh=True)
+                        if token:
+                            self._inject_auth_header(token)
+                            await self._cleanup_resources()
+                            await self._do_connect()
+                        else:
+                            raise RuntimeError(
+                                f"No valid OAuth token available for '{self.name}'. "
+                                "Run 'omlx mcp login' to authenticate."
+                            ) from first_exc
+                    except Exception as retry_exc:
+                        self._state = MCPServerState.ERROR
+                        self._error = str(retry_exc)
+                        logger.error(
+                            f"Failed to connect to MCP server '{self.name}' "
+                            f"after auth retry: {retry_exc}"
+                        )
+                        await self._cleanup_resources()
+                        return False
                 else:
-                    raise ValueError(f"Unknown transport: {self.config.transport}")
+                    self._state = MCPServerState.ERROR
+                    self._error = str(first_exc)
+                    logger.error(
+                        f"Failed to connect to MCP server '{self.name}': {first_exc}"
+                    )
+                    await self._cleanup_resources()
+                    return False
 
-                # Initialize session
-                await self._initialize_session()
+            self._state = MCPServerState.CONNECTED
+            self._last_connected = time.time()
+            auth_note = " (authenticated)" if self.config.auth else ""
+            logger.info(
+                f"Connected to MCP server '{self.name}'{auth_note} "
+                f"({len(self._tools)} tools available)"
+            )
+            return True
 
-                # Discover tools
-                await self._discover_tools()
+    async def _do_connect(self) -> None:
+        """Establish the transport connection and discover tools."""
+        if self.config.transport == MCPTransport.STDIO:
+            await self._connect_stdio()
+        elif self.config.transport == MCPTransport.SSE:
+            await self._connect_sse()
+        elif self.config.transport == MCPTransport.STREAMABLE_HTTP:
+            await self._connect_streamable_http()
+        else:
+            raise ValueError(f"Unknown transport: {self.config.transport}")
 
-                self._state = MCPServerState.CONNECTED
-                self._last_connected = time.time()
-                logger.info(
-                    f"Connected to MCP server '{self.name}' "
-                    f"({len(self._tools)} tools available)"
-                )
-                return True
+        await self._initialize_session()
+        await self._discover_tools()
 
-            except Exception as e:
-                self._state = MCPServerState.ERROR
-                self._error = str(e)
-                logger.error(f"Failed to connect to MCP server '{self.name}': {e}")
-                await self._cleanup_resources()
-                return False
+    async def _get_oauth_token(
+        self, force_refresh: bool = False
+    ) -> Optional[str]:
+        """
+        Retrieve an OAuth access token for this server.
+
+        When *force_refresh* is True and a refresh token is available the
+        stored token is refreshed before returning.
+        """
+        if self.config.auth is None:
+            return None
+
+        from .oauth import MCPOAuthManager  # lazy import
+
+        manager = MCPOAuthManager()
+
+        if force_refresh:
+            from .token_store import TokenStore  # lazy import
+            store = TokenStore(self.config.auth.token_store)
+            existing = store.load(self.name)
+            if existing and existing.refresh_token:
+                try:
+                    refreshed = await manager._do_refresh(
+                        self.config.auth, existing.refresh_token
+                    )
+                    store.save(self.name, refreshed)
+                    return refreshed.access_token
+                except Exception as exc:
+                    logger.warning(
+                        f"Force-refresh failed for '{self.name}': {exc}"
+                    )
+                    return None
+
+        return await manager.get_access_token(self.name, self.config.auth)
+
+    def _inject_auth_header(self, token: str) -> None:
+        """Add / replace the Bearer token in the server's headers dict."""
+        if self.config.headers is None:
+            self.config.headers = {}
+        self.config.headers["Authorization"] = f"Bearer {token}"
 
     async def _connect_stdio(self):
         """Connect via stdio transport."""
@@ -163,8 +267,9 @@ class MCPClient:
                 "MCP SDK required for MCP support. Install with: pip install mcp"
             )
 
+        headers = self.config.headers or {}
         # Create SSE client context
-        self._sse_client = sse_client(self.config.url)
+        self._sse_client = sse_client(self.config.url, headers=headers)
         self._read, self._write = await self._sse_client.__aenter__()
 
         try:
