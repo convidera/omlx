@@ -183,6 +183,10 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: Optional[float] = None
     # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
     specprefill_threshold: Optional[int] = None
+    # oMLX extension: when True the server executes MCP tool calls in a loop
+    # and returns the final model response. When False (default) tool_calls are
+    # returned to the client for it to handle.
+    execute_mcp_tools: bool = False
 
     @field_validator("stop", mode="before")
     @classmethod

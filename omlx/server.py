@@ -2048,6 +2048,107 @@ async def create_chat_completion(
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
 
+    # Server-side MCP agentic tool execution loop.
+    # When the server has an MCP executor and the model returned tool calls,
+    # execute them and continue the conversation until the model produces a
+    # final answer (or we hit the configured max_tool_calls limit).
+    if _server_state.mcp_executor is not None and tool_calls and request.execute_mcp_tools:
+        from .api.openai_models import FunctionCall, ToolCall  # noqa: F811
+
+        max_rounds = _server_state.mcp_manager.config.max_tool_calls
+        rounds_executed = 0
+
+        while tool_calls and rounds_executed < max_rounds:
+            rounds_executed += len(tool_calls)
+            logger.info(
+                f"Executing {len(tool_calls)} MCP tool call(s) "
+                f"({rounds_executed}/{max_rounds} budget used)"
+            )
+
+            # Serialize ToolCall Pydantic objects to dicts for the executor
+            tool_calls_dicts = [tc.model_dump() for tc in tool_calls]
+
+            # Execute tool calls against MCP servers
+            tool_result_msgs = await _server_state.mcp_executor.execute_and_format(tool_calls_dicts)
+
+            # Append assistant turn with tool calls
+            assistant_dict: dict = {
+                "role": "assistant",
+                "content": cleaned_text or "",
+                "tool_calls": tool_calls_dicts,
+            }
+            # Harmony chat_template applies |tojson to arguments — keep as dict
+            if engine.model_type == "gpt_oss":
+                for tc_dict in assistant_dict["tool_calls"]:
+                    args = tc_dict.get("function", {}).get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            tc_dict["function"]["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            messages.append(assistant_dict)
+
+            # Append tool result turns
+            for result_msg in tool_result_msgs:
+                msg = dict(result_msg)
+                # Harmony chat_template applies |tojson to content — keep as dict/list.
+                # Guard against json.loads returning None (e.g. "null") which would
+                # cause a TypeError in Jinja2 `in` containment checks on the template.
+                if engine.model_type == "gpt_oss":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        try:
+                            parsed = json.loads(content)
+                            if parsed is not None:
+                                msg["content"] = parsed
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                messages.append(msg)
+
+            # Re-run model to incorporate tool results
+            output = await _run_with_disconnect_guard(
+                http_request,
+                engine.chat(messages=messages, **chat_kwargs),
+            )
+            if output is None:
+                return  # Client disconnected
+
+            # Extract tool calls from new response
+            raw_text = clean_special_tokens(output.text) if output.text else ""
+            thinking_content, regular_content = extract_thinking(raw_text)
+            cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
+
+            if engine.model_type == "gpt_oss" and output.tool_calls:
+                tool_calls = [
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        type="function",
+                        function=FunctionCall(
+                            name=tc["name"],
+                            arguments=tc["arguments"],
+                        ),
+                    )
+                    for tc in output.tool_calls
+                ]
+                cleaned_text = regular_content
+            else:
+                extraction = extract_tool_calls_with_thinking(
+                    thinking_content,
+                    regular_content,
+                    tokenizer=engine.tokenizer,
+                    tools=tools_for_template,
+                )
+                cleaned_text = extraction.cleaned_text
+                tool_calls = extraction.tool_calls
+                cleaned_thinking = extraction.cleaned_thinking
+
+        if rounds_executed >= max_rounds and tool_calls:
+            logger.warning(
+                f"MCP tool call limit reached ({max_rounds}). "
+                "Returning last model output as final response."
+            )
+            tool_calls = None
+
     # Process response_format if specified
     if response_format and not tool_calls:
         cleaned_text, parsed_json, is_valid, error = parse_json_output(
@@ -2620,7 +2721,158 @@ async def stream_chat_completion(
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Emit tool call chunks if found
+    # Server-side MCP agentic tool execution loop (streaming).
+    # Execute tool calls silently, then continue streaming the follow-up
+    # model turn(s) into the same SSE connection.
+    if _server_state.mcp_executor is not None and tool_calls and request.execute_mcp_tools:
+        from .api.openai_models import FunctionCall, ToolCall  # noqa: F811
+
+        max_rounds = _server_state.mcp_manager.config.max_tool_calls
+        rounds_executed = 0
+
+        while tool_calls and rounds_executed < max_rounds:
+            rounds_executed += len(tool_calls)
+            logger.info(
+                f"Executing {len(tool_calls)} MCP tool call(s) "
+                f"({rounds_executed}/{max_rounds} budget used)"
+            )
+
+            tool_calls_dicts = [tc.model_dump() for tc in tool_calls]
+            tool_result_msgs = await _server_state.mcp_executor.execute_and_format(tool_calls_dicts)
+
+            # Append assistant turn with tool calls
+            assistant_dict: dict = {
+                "role": "assistant",
+                "content": cleaned_text or "",
+                "tool_calls": tool_calls_dicts,
+            }
+            # Harmony chat_template applies |tojson to arguments — keep as dict
+            if engine.model_type == "gpt_oss":
+                for tc_dict in assistant_dict["tool_calls"]:
+                    args = tc_dict.get("function", {}).get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            tc_dict["function"]["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            messages.append(assistant_dict)
+
+            # Append tool result turns
+            for result_msg in tool_result_msgs:
+                msg = dict(result_msg)
+                # Harmony chat_template applies |tojson to content — keep as dict/list.
+                # Guard against json.loads returning None (e.g. "null") which would
+                # cause a TypeError in Jinja2 `in` containment checks on the template.
+                if engine.model_type == "gpt_oss":
+                    content_val = msg.get("content", "")
+                    if isinstance(content_val, str):
+                        try:
+                            parsed = json.loads(content_val)
+                            if parsed is not None:
+                                msg["content"] = parsed
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                messages.append(msg)
+
+            # Re-stream the follow-up model turn
+            accumulated_text = ""
+            last_output = None
+            cleaned_text = ""
+            tool_calls = None
+            thinking_parser = ThinkingParser()
+            tool_filter = None
+            thinking_filter = None
+            stream_content = True
+            if has_tools:
+                _cf = ToolCallStreamFilter(engine.tokenizer)
+                _tf = ToolCallStreamFilter(engine.tokenizer)
+                if _cf.active:
+                    tool_filter = _cf
+                    thinking_filter = _tf
+                else:
+                    stream_content = False
+
+            try:
+                async for output in engine.stream_chat(messages=messages, **kwargs):
+                    if first_token_time is None and output.new_text:
+                        first_token_time = time.perf_counter()
+                    last_output = output
+                    if output.new_text:
+                        accumulated_text += output.new_text
+
+                    if stream_content and output.new_text:
+                        thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+                        if thinking_delta:
+                            if thinking_filter:
+                                thinking_delta = thinking_filter.feed(thinking_delta)
+                            if thinking_delta:
+                                yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+                        if content_delta:
+                            if tool_filter:
+                                content_delta = tool_filter.feed(content_delta)
+                            if content_delta:
+                                yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=content_delta), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+            except Exception as e:
+                logger.error(f"Error during MCP follow-up stream: {e}")
+                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'server_error'}})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            # Flush remaining buffered content
+            if stream_content:
+                thinking_delta, content_delta = thinking_parser.finish()
+                if thinking_delta:
+                    if thinking_filter:
+                        thinking_delta = thinking_filter.feed(thinking_delta)
+                    if thinking_delta:
+                        yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(reasoning_content=thinking_delta), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+                if thinking_filter:
+                    rem = thinking_filter.finish()
+                    if rem:
+                        yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(reasoning_content=rem), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+                if content_delta:
+                    if tool_filter:
+                        content_delta = tool_filter.feed(content_delta)
+                    if content_delta:
+                        yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=content_delta), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+                if tool_filter:
+                    rem = tool_filter.finish()
+                    if rem:
+                        yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=rem), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+
+            # Extract tool calls from the new response
+            if last_output and last_output.tool_calls:
+                tool_calls = [
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        type="function",
+                        function=FunctionCall(name=tc["name"], arguments=tc["arguments"]),
+                    )
+                    for tc in last_output.tool_calls
+                ]
+                cleaned_text = ""
+            elif has_tools and accumulated_text:
+                thinking_content, regular_content = extract_thinking(accumulated_text)
+                extraction = extract_tool_calls_with_thinking(
+                    thinking_content, regular_content,
+                    tokenizer=engine.tokenizer, tools=kwargs.get("tools"),
+                )
+                cleaned_text = extraction.cleaned_text
+                tool_calls = extraction.tool_calls
+                if not stream_content:
+                    if extraction.cleaned_thinking:
+                        yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(reasoning_content=extraction.cleaned_thinking), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+                    if cleaned_text:
+                        yield f"data: {ChatCompletionChunk(id=response_id, model=request.model, choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=cleaned_text), finish_reason=None)]).model_dump_json(exclude_none=True)}\n\n"
+
+        if rounds_executed >= max_rounds and tool_calls:
+            logger.warning(
+                f"MCP tool call limit reached ({max_rounds}). "
+                "Returning last model output as final response."
+            )
+            tool_calls = None
+
+    # Emit tool call chunks if found (only when no MCP executor — client handles tools)
     if tool_calls:
         for i, tc in enumerate(tool_calls):
             tc_chunk = ChatCompletionChunk(
