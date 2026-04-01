@@ -598,6 +598,15 @@
             // MCP server management
             // ------------------------------------------------------------------
 
+            mcpMd(text) {
+                if (!text) return '';
+                try {
+                    return DOMPurify.sanitize(marked.parse(text));
+                } catch(e) {
+                    return text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }
+            },
+
             async mcpReloadConfig() {
                 this.mcpReloading = true;
                 this.mcpReloadMessage = null;
