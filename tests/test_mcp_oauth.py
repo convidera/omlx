@@ -23,6 +23,7 @@ from omlx.mcp.oauth import (
     OAuthError,
     _generate_code_challenge,
     _generate_code_verifier,
+    _get_discovery_urls,
     _infer_device_auth_url,
     _parse_token_response,
 )
@@ -72,13 +73,12 @@ class TestMCPAuthConfig:
         assert cfg.client_id == "test-client"
         assert cfg.type == "oauth2"
 
-    def test_requires_client_id(self):
-        with pytest.raises(ValueError, match="client_id"):
-            MCPAuthConfig(client_id="", token_url="https://example.com/token")
-
-    def test_requires_token_url(self):
-        with pytest.raises(ValueError, match="token_url"):
-            MCPAuthConfig(client_id="id", token_url="")
+    def test_minimal_config_for_dcr(self):
+        # DCR mode: no client_id, auth_url, or token_url required at config time
+        cfg = MCPAuthConfig(type="oauth2")
+        assert cfg.client_id == ""
+        assert cfg.auth_url == ""
+        assert cfg.token_url == ""
 
     def test_unsupported_type(self):
         with pytest.raises(ValueError, match="Unsupported auth type"):
@@ -157,24 +157,24 @@ class TestAuthConfigParsing:
         with pytest.raises(ValueError, match="'auth' must be a dictionary"):
             validate_config(data)
 
-    def test_missing_client_id_in_auth_raises(self):
+    def test_minimal_auth_block_for_dcr_parses_fine(self):
+        """A bare {"type": "oauth2"} auth block should parse without error (DCR mode)."""
         from omlx.mcp.config import validate_config
 
         data = {
             "servers": {
-                "bad": {
-                    "transport": "sse",
-                    "url": "http://localhost/sse",
-                    "auth": {
-                        "type": "oauth2",
-                        "client_id": "",
-                        "token_url": "https://example.com/token",
-                    },
+                "notion": {
+                    "transport": "streamable-http",
+                    "url": "https://mcp.notion.com/mcp",
+                    "auth": {"type": "oauth2"},
                 }
             }
         }
-        with pytest.raises(ValueError):
-            validate_config(data)
+        cfg = validate_config(data)
+        auth = cfg.servers["notion"].auth
+        assert auth is not None
+        assert auth.client_id == ""
+        assert auth.token_url == ""
 
 
 # ---------------------------------------------------------------------------
@@ -537,3 +537,260 @@ class TestMCPClientAuthRetry:
         assert result is True
         # No auth header injected
         assert not (client.config.headers or {}).get("Authorization")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Client Registration (DCR) — RFC 7591 / RFC 8414
+# ---------------------------------------------------------------------------
+
+class TestDCRHelpers:
+    """Tests for OAuth AS metadata discovery and dynamic client registration."""
+
+    def test_get_discovery_urls_with_path(self):
+        from omlx.mcp.oauth import _get_discovery_urls
+        urls = _get_discovery_urls("https://mcp.notion.com/mcp")
+        assert urls[0] == "https://mcp.notion.com/.well-known/oauth-authorization-server/mcp"
+        assert urls[1] == "https://mcp.notion.com/.well-known/oauth-authorization-server"
+        assert urls[2] == "https://mcp.notion.com/.well-known/openid-configuration"
+
+    def test_get_discovery_urls_root_path(self):
+        from omlx.mcp.oauth import _get_discovery_urls
+        urls = _get_discovery_urls("https://example.com/")
+        # Root path → no path-specific candidate
+        assert urls[0] == "https://example.com/.well-known/oauth-authorization-server"
+
+    def test_get_discovery_urls_no_path(self):
+        from omlx.mcp.oauth import _get_discovery_urls
+        urls = _get_discovery_urls("https://example.com")
+        assert urls[0] == "https://example.com/.well-known/oauth-authorization-server"
+
+    @pytest.mark.asyncio
+    async def test_discover_oauth_metadata_success(self):
+        from omlx.mcp.oauth import _discover_oauth_metadata
+        import httpx
+
+        metadata = {
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token",
+            "registration_endpoint": "https://example.com/register",
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = metadata
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_aclient = AsyncMock()
+            mock_aclient.__aenter__ = AsyncMock(return_value=mock_aclient)
+            mock_aclient.__aexit__ = AsyncMock(return_value=False)
+            mock_aclient.get = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value = mock_aclient
+
+            result = await _discover_oauth_metadata("https://example.com/mcp")
+
+        assert result["authorization_endpoint"] == "https://example.com/authorize"
+        assert result["registration_endpoint"] == "https://example.com/register"
+
+    @pytest.mark.asyncio
+    async def test_discover_oauth_metadata_falls_back_on_404(self):
+        """Should try next URL when one returns 404."""
+        from omlx.mcp.oauth import _discover_oauth_metadata
+
+        metadata = {"authorization_endpoint": "https://example.com/auth"}
+        not_found = MagicMock()
+        not_found.status_code = 404
+        ok_response = MagicMock()
+        ok_response.status_code = 200
+        ok_response.json.return_value = metadata
+
+        responses = [not_found, ok_response]
+        call_count = {"n": 0}
+
+        async def fake_get(url, **kwargs):
+            resp = responses[call_count["n"]]
+            call_count["n"] += 1
+            return resp
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_aclient = AsyncMock()
+            mock_aclient.__aenter__ = AsyncMock(return_value=mock_aclient)
+            mock_aclient.__aexit__ = AsyncMock(return_value=False)
+            mock_aclient.get = fake_get
+            mock_client_cls.return_value = mock_aclient
+
+            result = await _discover_oauth_metadata("https://example.com")
+
+        assert result["authorization_endpoint"] == "https://example.com/auth"
+
+    @pytest.mark.asyncio
+    async def test_discover_oauth_metadata_raises_when_all_fail(self):
+        from omlx.mcp.oauth import _discover_oauth_metadata, OAuthError
+
+        not_found = MagicMock()
+        not_found.status_code = 404
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_aclient = AsyncMock()
+            mock_aclient.__aenter__ = AsyncMock(return_value=mock_aclient)
+            mock_aclient.__aexit__ = AsyncMock(return_value=False)
+            mock_aclient.get = AsyncMock(return_value=not_found)
+            mock_client_cls.return_value = mock_aclient
+
+            with pytest.raises(OAuthError, match="Could not discover"):
+                await _discover_oauth_metadata("https://example.com")
+
+    @pytest.mark.asyncio
+    async def test_register_dynamic_client_success(self):
+        from omlx.mcp.oauth import _register_dynamic_client
+
+        reg_response = MagicMock()
+        reg_response.is_success = True
+        reg_response.json.return_value = {"client_id": "dyn-client-abc"}
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_aclient = AsyncMock()
+            mock_aclient.__aenter__ = AsyncMock(return_value=mock_aclient)
+            mock_aclient.__aexit__ = AsyncMock(return_value=False)
+            mock_aclient.post = AsyncMock(return_value=reg_response)
+            mock_client_cls.return_value = mock_aclient
+
+            client_id = await _register_dynamic_client(
+                "https://example.com/register",
+                redirect_uri="http://localhost:12345/callback",
+            )
+
+        assert client_id == "dyn-client-abc"
+
+    @pytest.mark.asyncio
+    async def test_register_dynamic_client_raises_on_error(self):
+        from omlx.mcp.oauth import _register_dynamic_client, OAuthError
+
+        err_response = MagicMock()
+        err_response.is_success = False
+        err_response.status_code = 400
+        err_response.text = "Bad Request"
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_aclient = AsyncMock()
+            mock_aclient.__aenter__ = AsyncMock(return_value=mock_aclient)
+            mock_aclient.__aexit__ = AsyncMock(return_value=False)
+            mock_aclient.post = AsyncMock(return_value=err_response)
+            mock_client_cls.return_value = mock_aclient
+
+            with pytest.raises(OAuthError, match="Dynamic Client Registration failed"):
+                await _register_dynamic_client(
+                    "https://example.com/register",
+                    redirect_uri="http://localhost:12345/callback",
+                )
+
+    @pytest.mark.asyncio
+    async def test_pkce_flow_uses_dcr_when_no_client_id(self, tmp_path: Path):
+        """When client_id is empty, _pkce_flow should perform DCR."""
+        dcr_config = MCPAuthConfig(type="oauth2")  # no client_id / URLs
+        store = TokenStore(store_path=str(tmp_path / "t.json"))
+        store._use_keyring = False
+        manager = MCPOAuthManager(token_store=store)
+
+        discovered_meta = {
+            "authorization_endpoint": "https://as.example.com/authorize",
+            "token_endpoint": "https://as.example.com/token",
+            "registration_endpoint": "https://as.example.com/register",
+        }
+        discovered_client_id = "dyn-xyz"
+        token_resp = TokenData(
+            access_token="access-token",
+            refresh_token="refresh-token",
+            expires_at=time.time() + 3600,
+        )
+
+        with (
+            patch(
+                "omlx.mcp.oauth._discover_oauth_metadata",
+                new=AsyncMock(return_value=discovered_meta),
+            ),
+            patch(
+                "omlx.mcp.oauth._register_dynamic_client",
+                new=AsyncMock(return_value=discovered_client_id),
+            ),
+            patch(
+                "omlx.mcp.oauth._start_callback_server",
+                return_value=(12345, MagicMock()),
+            ),
+            patch("webbrowser.open"),
+            patch.object(
+                manager, "_exchange_code", new=AsyncMock(return_value=token_resp)
+            ) as mock_exchange,
+        ):
+            # Simulate browser callback arriving in the queue
+            from queue import Queue as _Queue
+            q = _Queue()
+            q.put({"code": "auth-code-123", "state": "stub-state"})
+
+            # Patch state generation to a fixed value
+            with patch("omlx.mcp.oauth.secrets.token_urlsafe", return_value="stub-state"):
+                with patch(
+                    "omlx.mcp.oauth._start_callback_server",
+                    return_value=(12345, q),
+                ):
+                    result = await manager._pkce_flow(
+                        "notion", dcr_config, server_url="https://mcp.notion.com/mcp"
+                    )
+
+        assert result.access_token == "access-token"
+        # Dynamically registered client_id should be persisted in the token
+        assert result.registered_client_id == discovered_client_id
+
+    @pytest.mark.asyncio
+    async def test_pkce_flow_raises_without_server_url_when_no_client_id(self):
+        """If no server_url and no client_id, _pkce_flow must raise OAuthError."""
+        from omlx.mcp.oauth import OAuthError
+
+        dcr_config = MCPAuthConfig(type="oauth2")
+        store = TokenStore.__new__(TokenStore)
+        manager = MCPOAuthManager(token_store=MagicMock())
+
+        with pytest.raises(OAuthError, match="no server_url"):
+            await manager._pkce_flow("srv", dcr_config, server_url=None)
+
+    @pytest.mark.asyncio
+    async def test_do_refresh_uses_registered_client_id(self, tmp_path: Path):
+        """_do_refresh should use registered_client_id from stored token when auth_config has none."""
+        minimal_config = MCPAuthConfig(
+            type="oauth2",
+            token_url="https://as.example.com/token",
+        )
+        stored_token = TokenData(
+            access_token="old",
+            refresh_token="rt",
+            registered_client_id="dyn-client-456",
+        )
+        new_token_resp = {
+            "access_token": "new-at",
+            "token_type": "Bearer",
+        }
+        ok_response = MagicMock()
+        ok_response.status_code = 200
+        ok_response.raise_for_status = MagicMock()
+        ok_response.json.return_value = new_token_resp
+
+        store = TokenStore(store_path=str(tmp_path / "t.json"))
+        store._use_keyring = False
+        manager = MCPOAuthManager(token_store=store)
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_aclient = AsyncMock()
+            mock_aclient.__aenter__ = AsyncMock(return_value=mock_aclient)
+            mock_aclient.__aexit__ = AsyncMock(return_value=False)
+            mock_aclient.post = AsyncMock(return_value=ok_response)
+            mock_client_cls.return_value = mock_aclient
+
+            result = await manager._do_refresh(
+                minimal_config, "rt", stored_token=stored_token
+            )
+
+        assert result.access_token == "new-at"
+        assert result.registered_client_id == "dyn-client-456"
+        # Verify the client_id used in the POST body
+        call_kwargs = mock_aclient.post.call_args
+        sent_data = call_kwargs.kwargs.get("data") or call_kwargs[1].get("data", {})
+        assert sent_data.get("client_id") == "dyn-client-456"

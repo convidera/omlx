@@ -211,7 +211,7 @@ class MCPClient:
             if existing and existing.refresh_token:
                 try:
                     refreshed = await manager._do_refresh(
-                        self.config.auth, existing.refresh_token
+                        self.config.auth, existing.refresh_token, stored_token=existing
                     )
                     store.save(self.name, refreshed)
                     return refreshed.access_token
@@ -221,7 +221,7 @@ class MCPClient:
                     )
                     return None
 
-        return await manager.get_access_token(self.name, self.config.auth)
+        return await manager.get_access_token(self.name, self.config.auth, server_url=self.config.url)
 
     def _inject_auth_header(self, token: str) -> None:
         """Add / replace the Bearer token in the server's headers dict."""

@@ -33,6 +33,9 @@ class TokenData:
     refresh_token: Optional[str] = None
     expires_at: Optional[float] = None  # Unix timestamp
     scope: Optional[str] = None
+    # Persisted client_id obtained via Dynamic Client Registration (DCR).
+    # Set when the server uses RFC 7591 auto-registration (e.g. Notion remote MCP).
+    registered_client_id: Optional[str] = None
 
     @property
     def is_expired(self) -> bool:
