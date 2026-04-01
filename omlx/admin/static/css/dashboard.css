@@ -245,3 +245,4 @@
     .mcp-tool-desc a { color: #2563eb; text-decoration: none; }
     .mcp-tool-desc a:hover { text-decoration: underline; }
     .mcp-tool-desc h1, .mcp-tool-desc h2, .mcp-tool-desc h3 { font-size: 0.75rem; font-weight: 600; color: #404040; margin: 0.3rem 0 0.15rem; }
+    .mcp-tool-desc-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }

@@ -356,6 +356,7 @@
             mcpActionLoading: {},  // { serverName: 'reconnect'|'auth'|'logout' }
             mcpMessages: {},       // { serverName: { type: 'error'|'ok', text: '...' } }
             mcpExpandedServer: null,
+            mcpToolModal: null,
             mcpReloading: false,
             mcpReloadMessage: null,
             mcpShowConfigEditor: false,
