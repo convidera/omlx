@@ -50,6 +50,7 @@ class MCPClient:
         self._error: Optional[str] = None
         self._last_connected: Optional[float] = None
         self._lock = asyncio.Lock()
+        self._transport_tasks: List = []  # list of (task, disconnect_event)
 
     @property
     def name(self) -> str:
@@ -229,6 +230,62 @@ class MCPClient:
             self.config.headers = {}
         self.config.headers["Authorization"] = f"Bearer {token}"
 
+    async def _run_transport_in_task(self, cm, streams_future: asyncio.Future, disconnect_event: asyncio.Event, nstreams: int = 2):
+        """
+        Enter *cm* (a transport context manager) inside this asyncio Task,
+        hand the resulting streams back via *streams_future*, then hold the
+        connection open until *disconnect_event* is set.
+
+        Running the context manager entirely within a single Task keeps
+        anyio cancel-scopes satisfied — they require __aexit__ to be called
+        from the same task as __aenter__.
+        """
+        try:
+            result = await cm.__aenter__()
+            streams = result[:nstreams] if nstreams < len(result) else result
+            streams_future.set_result(streams)
+            await disconnect_event.wait()
+        except Exception as exc:
+            if not streams_future.done():
+                streams_future.set_exception(exc)
+        finally:
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.debug("Transport __aexit__ raised (expected on cancel): %s", exc)
+
+    async def _start_transport_task(self, cm, nstreams: int = 2):
+        """
+        Spawn a background Task for *cm*, wait for streams to be ready, and
+        return them.  Stores the task and disconnect event on *self* so that
+        _cleanup_resources can tear it down gracefully.
+        """
+        loop = asyncio.get_event_loop()
+        streams_future: asyncio.Future = loop.create_future()
+        disconnect_event = asyncio.Event()
+
+        task = asyncio.create_task(
+            self._run_transport_in_task(cm, streams_future, disconnect_event, nstreams)
+        )
+        try:
+            streams = await asyncio.wait_for(
+                asyncio.shield(streams_future),
+                timeout=self.config.timeout,
+            )
+        except Exception:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
+
+        # Store so _cleanup_resources can signal teardown
+        if not hasattr(self, "_transport_tasks"):
+            self._transport_tasks = []
+        self._transport_tasks.append((task, disconnect_event))
+        return streams
+
     async def _connect_stdio(self):
         """Connect via stdio transport."""
         try:
@@ -244,18 +301,11 @@ class MCPClient:
             args=self.config.args or [],
             env=self.config.env,
         )
-
-        # Create stdio client context
-        self._stdio_client = stdio_client(server_params)
-        self._read, self._write = await self._stdio_client.__aenter__()
-
-        try:
-            self._session = ClientSession(self._read, self._write)
-            await self._session.__aenter__()
-        except Exception:
-            await self._stdio_client.__aexit__(None, None, None)
-            self._stdio_client = None
-            raise
+        self._read, self._write = await self._start_transport_task(
+            stdio_client(server_params), nstreams=2
+        )
+        self._session = ClientSession(self._read, self._write)
+        await self._session.__aenter__()
 
     async def _connect_sse(self):
         """Connect via SSE transport."""
@@ -268,17 +318,11 @@ class MCPClient:
             )
 
         headers = self.config.headers or {}
-        # Create SSE client context
-        self._sse_client = sse_client(self.config.url, headers=headers)
-        self._read, self._write = await self._sse_client.__aenter__()
-
-        try:
-            self._session = ClientSession(self._read, self._write)
-            await self._session.__aenter__()
-        except Exception:
-            await self._sse_client.__aexit__(None, None, None)
-            self._sse_client = None
-            raise
+        self._read, self._write = await self._start_transport_task(
+            sse_client(self.config.url, headers=headers), nstreams=2
+        )
+        self._session = ClientSession(self._read, self._write)
+        await self._session.__aenter__()
 
     async def _connect_streamable_http(self):
         """Connect via streamable_http transport."""
@@ -292,23 +336,14 @@ class MCPClient:
             )
 
         headers = self.config.headers or {}
-        self._http_client = httpx.AsyncClient(headers=headers)
-        await self._http_client.__aenter__()
-
-        try:
-            self._streamable_http_client = streamable_http_client(
-                url=self.config.url, http_client=self._http_client
-            )
-            self._read, self._write, _ = await self._streamable_http_client.__aenter__()
-            self._session = ClientSession(self._read, self._write)
-            await self._session.__aenter__()
-        except Exception:
-            if hasattr(self, '_streamable_http_client') and self._streamable_http_client:
-                await self._streamable_http_client.__aexit__(None, None, None)
-                self._streamable_http_client = None
-            await self._http_client.__aexit__(None, None, None)
-            self._http_client = None
-            raise
+        http_client = httpx.AsyncClient(headers=headers)
+        # nstreams=2: streamable_http_client yields (read, write, get_session_id)
+        self._read, self._write = await self._start_transport_task(
+            streamable_http_client(url=self.config.url, http_client=http_client),
+            nstreams=2,
+        )
+        self._session = ClientSession(self._read, self._write)
+        await self._session.__aenter__()
 
     async def _initialize_session(self):
         """Initialize the MCP session."""
@@ -350,27 +385,21 @@ class MCPClient:
         """Clean up connection resources without acquiring lock."""
         try:
             if self._session:
-                await self._session.__aexit__(None, None, None)
+                try:
+                    await self._session.__aexit__(None, None, None)
+                except Exception as exc:
+                    logger.debug("Session __aexit__ raised for '%s': %s", self.name, exc)
                 self._session = None
 
-            if hasattr(self, '_stdio_client') and self._stdio_client:
-                await self._stdio_client.__aexit__(None, None, None)
-                self._stdio_client = None
-
-            if hasattr(self, '_sse_client') and self._sse_client:
-                await self._sse_client.__aexit__(None, None, None)
-                self._sse_client = None
-
-            if (
-                hasattr(self, "_streamable_http_client")
-                and self._streamable_http_client
-            ):
-                await self._streamable_http_client.__aexit__(None, None, None)
-                self._streamable_http_client = None
-
-            if hasattr(self, "_http_client") and self._http_client:
-                await self._http_client.__aexit__(None, None, None)
-                self._http_client = None
+            # Signal all background transport tasks to disconnect and wait for them
+            for task, disconnect_event in getattr(self, "_transport_tasks", []):
+                disconnect_event.set()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as exc:
+                    logger.debug("Transport task teardown for '%s': %s", self.name, exc)
+                    task.cancel()
+            self._transport_tasks = []
 
         except Exception as e:
             logger.warning(f"Error cleaning up resources for '{self.name}': {e}")
