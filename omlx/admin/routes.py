@@ -4009,6 +4009,19 @@ async def get_mcp_servers(is_admin: bool = Depends(require_admin)):
             info["has_auth"] = cfg.auth is not None
             if cfg.auth:
                 info["auth_info"] = oauth_manager.get_token_info(status.name)
+        # Include tool list for connected servers
+        client = _server_state.mcp_manager._clients.get(status.name)
+        if client and client.tools:
+            info["tools"] = [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "param_count": len((t.input_schema or {}).get("properties", {})),
+                }
+                for t in client.tools
+            ]
+        else:
+            info["tools"] = []
         result.append(info)
 
     config_path = _get_mcp_config_path()

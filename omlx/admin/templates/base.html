@@ -135,7 +135,11 @@
                 if (!def) return;
                 var svg = lucide.createElement(def);
                 Array.from(el.attributes).forEach(function(a) {
-                    if (a.name !== 'data-lucide') svg.setAttribute(a.name, a.value);
+                    // Skip data-lucide and Alpine.js binding attributes (@, :, x-)
+                    // to avoid InvalidCharacterError on invalid SVG attribute names.
+                    if (a.name === 'data-lucide') return;
+                    if (a.name.startsWith('@') || a.name.startsWith('x-')) return;
+                    try { svg.setAttribute(a.name, a.value); } catch(e) {}
                 });
                 svg.classList.add('lucide', 'lucide-' + name);
                 if (el.parentNode) el.parentNode.replaceChild(svg, el);

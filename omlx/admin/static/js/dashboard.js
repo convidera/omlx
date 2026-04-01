@@ -355,6 +355,7 @@
             mcpMaxToolCalls: 10,
             mcpActionLoading: {},  // { serverName: 'reconnect'|'auth'|'logout' }
             mcpMessages: {},       // { serverName: { type: 'error'|'ok', text: '...' } }
+            mcpExpandedServer: null,
             mcpShowConfigEditor: false,
             mcpConfigJson: '',
             mcpConfigSaving: false,
@@ -401,10 +402,6 @@
                     if (this.msSearchQuery.trim()) {
                         this.searchMSModels();
                     }
-                });
-
-                this.$watch('mcpShowConfigEditor', (val) => {
-                    if (val && !this.mcpConfigJson) this.loadMcpConfig();
                 });
 
                 window.addEventListener('popstate', () => {
