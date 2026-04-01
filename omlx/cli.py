@@ -245,6 +245,109 @@ def serve_command(args):
     )
 
 
+def mcp_command(args):
+    """Handle 'omlx mcp' subcommands (login, logout, status)."""
+    import asyncio
+    import sys
+
+    sub = args.mcp_subcommand
+
+    if sub == "status":
+        _mcp_status(args)
+    elif sub == "login":
+        asyncio.run(_mcp_login(args))
+    elif sub == "logout":
+        _mcp_logout(args)
+    else:
+        # No subcommand given — print help.
+        print("Usage: omlx mcp {login,logout,status} <server>")
+        sys.exit(1)
+
+
+def _mcp_status(args) -> None:
+    """Print OAuth auth status for MCP servers."""
+    from .mcp.config import load_mcp_config
+    from .mcp.oauth import MCPOAuthManager
+
+    config = load_mcp_config(args.mcp_config)
+    if not config.servers:
+        print("No MCP servers configured.")
+        return
+
+    manager = MCPOAuthManager()
+    for name, server in config.servers.items():
+        if not server.auth:
+            print(f"  {name}: no OAuth configured")
+            continue
+        info = manager.get_token_info(name)
+        if info is None:
+            print(f"  {name}: not authenticated")
+        elif info.get("is_expired"):
+            print(f"  {name}: token expired (run 'omlx mcp login {name}' to re-authenticate)")
+        else:
+            scope = info.get("scope") or ""
+            expires_at = info.get("expires_at")
+            expiry_note = ""
+            if expires_at:
+                import time
+                remaining = int(expires_at - time.time())
+                expiry_note = f", expires in {remaining}s"
+            print(f"  {name}: authenticated (scope={scope!r}{expiry_note})")
+
+
+async def _mcp_login(args) -> None:
+    """Perform OAuth login for an MCP server."""
+    import sys
+
+    from .mcp.config import load_mcp_config
+    from .mcp.oauth import MCPOAuthManager
+
+    server_name: str = args.server
+    flow: str = args.flow
+
+    config = load_mcp_config(args.mcp_config)
+
+    if server_name not in config.servers:
+        print(f"Unknown MCP server: '{server_name}'")
+        print(f"Configured servers: {', '.join(config.servers) or '(none)'}")
+        sys.exit(1)
+
+    server = config.servers[server_name]
+    if not server.auth:
+        print(
+            f"MCP server '{server_name}' has no OAuth configuration. "
+            "Add an 'auth' block to its config entry."
+        )
+        sys.exit(1)
+
+    manager = MCPOAuthManager()
+    try:
+        token = await manager.login(server_name, server.auth, flow=flow)
+        scope = token.scope or ""
+        print(f"\nAuthentication successful for '{server_name}' (scope={scope!r})")
+    except Exception as exc:
+        print(f"\nAuthentication failed for '{server_name}': {exc}")
+        sys.exit(1)
+
+
+def _mcp_logout(args) -> None:
+    """Remove stored OAuth tokens for an MCP server."""
+    import sys
+
+    from .mcp.config import load_mcp_config
+    from .mcp.oauth import MCPOAuthManager
+
+    server_name: str = args.server
+
+    config = load_mcp_config(args.mcp_config)
+    if server_name not in config.servers:
+        print(f"Unknown MCP server: '{server_name}'")
+        sys.exit(1)
+
+    manager = MCPOAuthManager()
+    manager.logout(server_name)
+    print(f"Logged out from '{server_name}': stored tokens removed.")
+
 
 def launch_command(args):
     """Launch an external tool integrated with oMLX."""
@@ -558,12 +661,68 @@ Example directory structure:
         help="OpenClaw tools profile (default: coding)",
     )
 
+    # MCP command (login / logout / status)
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="Manage MCP server OAuth authentication",
+        description="Authenticate with OAuth-protected MCP servers.",
+    )
+    mcp_parser.add_argument(
+        "--mcp-config",
+        type=str,
+        default=None,
+        help="Path to MCP configuration file (default: auto-detected)",
+    )
+    mcp_subparsers = mcp_parser.add_subparsers(
+        dest="mcp_subcommand", help="MCP auth commands"
+    )
+
+    # omlx mcp status
+    mcp_status_parser = mcp_subparsers.add_parser(
+        "status",
+        help="Show OAuth authentication status for all configured MCP servers",
+    )
+
+    # omlx mcp login <server>
+    mcp_login_parser = mcp_subparsers.add_parser(
+        "login",
+        help="Authenticate with an OAuth-protected MCP server",
+    )
+    mcp_login_parser.add_argument(
+        "server",
+        type=str,
+        help="MCP server name as defined in the config file",
+    )
+    mcp_login_parser.add_argument(
+        "--flow",
+        type=str,
+        default="pkce",
+        choices=["pkce", "device"],
+        help=(
+            "OAuth flow to use: 'pkce' opens a browser (default), "
+            "'device' prints a code for headless environments"
+        ),
+    )
+
+    # omlx mcp logout <server>
+    mcp_logout_parser = mcp_subparsers.add_parser(
+        "logout",
+        help="Remove stored OAuth tokens for an MCP server",
+    )
+    mcp_logout_parser.add_argument(
+        "server",
+        type=str,
+        help="MCP server name as defined in the config file",
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
         serve_command(args)
     elif args.command == "launch":
         launch_command(args)
+    elif args.command == "mcp":
+        mcp_command(args)
     else:
         parser.print_help()
         sys.exit(1)

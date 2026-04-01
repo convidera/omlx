@@ -6,7 +6,7 @@ Type definitions for MCP client support.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 
 class MCPTransport(str, Enum):
@@ -22,6 +22,29 @@ class MCPServerState(str, Enum):
     CONNECTING = "connecting"
     CONNECTED = "connected"
     ERROR = "error"
+
+
+@dataclass
+class MCPAuthConfig:
+    """OAuth 2.0 authentication configuration for an MCP server."""
+
+    type: str = "oauth2"
+    client_id: str = ""
+    auth_url: str = ""
+    token_url: str = ""
+    scopes: Optional[List[str]] = None
+    audience: Optional[str] = None
+    device_auth_url: Optional[str] = None
+    token_store: Optional[str] = None
+
+    def __post_init__(self):
+        """Validate OAuth configuration."""
+        if self.type != "oauth2":
+            raise ValueError(f"Unsupported auth type: '{self.type}'. Only 'oauth2' is supported.")
+        if not self.client_id:
+            raise ValueError("OAuth2 auth config requires 'client_id'")
+        if not self.token_url:
+            raise ValueError("OAuth2 auth config requires 'token_url'")
 
 
 @dataclass
@@ -41,6 +64,9 @@ class MCPServerConfig:
 
     # For streamable-http transport
     headers: Optional[Dict[str, str]] = None
+
+    # OAuth 2.0 authentication (optional)
+    auth: Optional[MCPAuthConfig] = None
 
     # Common options
     enabled: bool = True
@@ -147,6 +173,7 @@ class MCPServerStatus:
     tools_count: int = 0
     error: Optional[str] = None
     last_connected: Optional[float] = None
+    auth_state: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for API response."""
@@ -157,4 +184,5 @@ class MCPServerStatus:
             "tools_count": self.tools_count,
             "error": self.error,
             "last_connected": self.last_connected,
+            "auth_state": self.auth_state,
         }
