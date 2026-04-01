@@ -4898,3 +4898,46 @@ async def save_mcp_config_route(request: Request, is_admin: bool = Depends(requi
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not write config: {exc}")
     return {"success": True, "path": str(path)}
+
+
+@router.post("/api/mcp/reload")
+async def reload_mcp_config(is_admin: bool = Depends(require_admin)):
+    """Stop the current MCP manager, reload config from disk, and restart.
+
+    This lets config changes (new servers, edited URLs, etc.) take effect
+    without restarting the whole server process.
+    """
+    from ..server import _server_state
+    from ..mcp import MCPClientManager, ToolExecutor, load_mcp_config
+
+    config_path = _get_mcp_config_path()
+    if config_path is None:
+        raise HTTPException(status_code=404, detail="No MCP config file found")
+
+    try:
+        new_config = load_mcp_config(config_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}")
+
+    # Stop old manager gracefully
+    if _server_state.mcp_manager is not None:
+        try:
+            await _server_state.mcp_manager.stop()
+        except Exception:
+            pass
+        _server_state.mcp_manager = None
+        _server_state.mcp_executor = None
+
+    # Start fresh
+    try:
+        _server_state.mcp_manager = MCPClientManager(new_config)
+        await _server_state.mcp_manager.start()
+        _server_state.mcp_executor = ToolExecutor(_server_state.mcp_manager)
+    except Exception as exc:
+        logger.error("MCP reload failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to start MCP: {exc}")
+
+    tool_count = len(_server_state.mcp_manager.get_all_tools())
+    server_count = len(new_config.servers)
+    logger.info("MCP config reloaded: %d servers, %d tools", server_count, tool_count)
+    return {"success": True, "servers": server_count, "tools": tool_count}
