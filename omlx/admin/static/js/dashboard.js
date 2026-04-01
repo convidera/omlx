@@ -5,7 +5,7 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
-    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
+    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench', 'mcp']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
@@ -404,6 +404,20 @@
             accShowText: false,
             accCopied: false,
 
+            // MCP server management
+            mcpServers: [],
+            mcpAvailable: false,
+            mcpLoading: false,
+            mcpConfigPath: null,
+            mcpMaxToolCalls: 10,
+            mcpActionLoading: {},  // { serverName: 'reconnect'|'auth'|'logout' }
+            mcpMessages: {},       // { serverName: { type: 'error'|'ok', text: '...' } }
+            mcpShowConfigEditor: false,
+            mcpConfigJson: '',
+            mcpConfigSaving: false,
+            mcpConfigSaved: false,
+            mcpConfigError: '',
+
             async init() {
                 // Apply theme
                 this.applyTheme();
@@ -448,6 +462,10 @@
                     }
                 });
 
+                this.$watch('mcpShowConfigEditor', (val) => {
+                    if (val && !this.mcpConfigJson) this.loadMcpConfig();
+                });
+
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
                 });
@@ -464,6 +482,9 @@
             },
 
             async handleMainTabChange(value) {
+                if (value === 'mcp') {
+                    await this.loadMcpServers();
+                }
                 if (value === 'status') {
                     await this.loadStats();
                     this.startStatsRefresh();
@@ -573,6 +594,155 @@
                     this.loadUploadTasks();
                 }
             },
+
+            // ------------------------------------------------------------------
+            // MCP server management
+            // ------------------------------------------------------------------
+
+            async loadMcpServers() {
+                this.mcpLoading = true;
+                try {
+                    const resp = await fetch('/admin/api/mcp/servers');
+                    if (!resp.ok) throw new Error(await resp.text());
+                    const data = await resp.json();
+                    this.mcpServers = data.servers || [];
+                    this.mcpAvailable = data.available || false;
+                    this.mcpConfigPath = data.config_path || null;
+                    this.mcpMaxToolCalls = data.max_tool_calls || 10;
+                } catch (e) {
+                    console.error('Failed to load MCP servers:', e);
+                } finally {
+                    this.mcpLoading = false;
+                }
+            },
+
+            async loadMcpConfig() {
+                try {
+                    const resp = await fetch('/admin/api/mcp/config');
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    this.mcpConfigJson = JSON.stringify(data.config, null, 2);
+                    if (data.path) this.mcpConfigPath = data.path;
+                } catch (e) {
+                    console.error('Failed to load MCP config:', e);
+                }
+            },
+
+            async mcpSaveConfig() {
+                this.mcpConfigError = '';
+                this.mcpConfigSaved = false;
+                let parsed;
+                try {
+                    parsed = JSON.parse(this.mcpConfigJson);
+                } catch (e) {
+                    this.mcpConfigError = 'Invalid JSON: ' + e.message;
+                    return;
+                }
+                this.mcpConfigSaving = true;
+                try {
+                    const resp = await fetch('/admin/api/mcp/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ config: parsed }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        this.mcpConfigError = data.detail || 'Save failed';
+                    } else {
+                        this.mcpConfigSaved = true;
+                        if (data.path) this.mcpConfigPath = data.path;
+                        setTimeout(() => { this.mcpConfigSaved = false; }, 4000);
+                    }
+                } catch (e) {
+                    this.mcpConfigError = e.message;
+                } finally {
+                    this.mcpConfigSaving = false;
+                }
+            },
+
+            mcpFormatConfig() {
+                try {
+                    this.mcpConfigJson = JSON.stringify(JSON.parse(this.mcpConfigJson), null, 2);
+                    this.mcpConfigError = '';
+                } catch (e) {
+                    this.mcpConfigError = 'Invalid JSON: ' + e.message;
+                }
+            },
+
+            async mcpReconnect(name) {
+                this.mcpActionLoading = { ...this.mcpActionLoading, [name]: 'reconnect' };
+                this.mcpMessages = { ...this.mcpMessages, [name]: null };
+                try {
+                    const resp = await fetch(`/admin/api/mcp/servers/${encodeURIComponent(name)}/reconnect`, { method: 'POST' });
+                    if (!resp.ok) throw new Error((await resp.json()).detail || 'Reconnect failed');
+                    await this.loadMcpServers();
+                } catch (e) {
+                    this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'error', text: e.message } };
+                } finally {
+                    this.mcpActionLoading = { ...this.mcpActionLoading, [name]: null };
+                }
+            },
+
+            async mcpAuthenticate(name) {
+                this.mcpActionLoading = { ...this.mcpActionLoading, [name]: 'auth' };
+                this.mcpMessages = { ...this.mcpMessages, [name]: null };
+                try {
+                    const resp = await fetch(`/admin/api/mcp/servers/${encodeURIComponent(name)}/authenticate`, { method: 'POST' });
+                    const data = await resp.json();
+                    if (!resp.ok) throw new Error(data.detail || 'Authentication failed');
+
+                    const popup = window.open(data.auth_url, '_blank',
+                        'width=520,height=680,left=' + (screen.width/2 - 260) + ',top=' + (screen.height/2 - 340));
+
+                    // Listen for completion via postMessage from the callback page
+                    const handler = async (event) => {
+                        try {
+                            const msg = JSON.parse(event.data);
+                            if (msg.type !== 'mcp_oauth_complete') return;
+                            window.removeEventListener('message', handler);
+                            if (popup && !popup.closed) popup.close();
+                            if (msg.success) {
+                                this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'ok', text: 'Authentication successful' } };
+                                await this.loadMcpServers();
+                                setTimeout(() => { this.mcpMessages = { ...this.mcpMessages, [name]: null }; }, 4000);
+                            } else {
+                                this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'error', text: 'Authentication failed' } };
+                            }
+                        } catch(e) {}
+                        this.mcpActionLoading = { ...this.mcpActionLoading, [name]: null };
+                    };
+                    window.addEventListener('message', handler);
+
+                    // Fallback: clear loading state if popup is closed without message
+                    const pollClose = setInterval(() => {
+                        if (popup && popup.closed) {
+                            clearInterval(pollClose);
+                            window.removeEventListener('message', handler);
+                            this.mcpActionLoading = { ...this.mcpActionLoading, [name]: null };
+                            this.loadMcpServers();
+                        }
+                    }, 1000);
+                } catch (e) {
+                    this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'error', text: e.message } };
+                    this.mcpActionLoading = { ...this.mcpActionLoading, [name]: null };
+                }
+            },
+
+            async mcpLogout(name) {
+                this.mcpActionLoading = { ...this.mcpActionLoading, [name]: 'logout' };
+                this.mcpMessages = { ...this.mcpMessages, [name]: null };
+                try {
+                    const resp = await fetch(`/admin/api/mcp/servers/${encodeURIComponent(name)}/logout`, { method: 'POST' });
+                    if (!resp.ok) throw new Error((await resp.json()).detail || 'Logout failed');
+                    await this.loadMcpServers();
+                } catch (e) {
+                    this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'error', text: e.message } };
+                } finally {
+                    this.mcpActionLoading = { ...this.mcpActionLoading, [name]: null };
+                }
+            },
+
+            // ------------------------------------------------------------------
 
             async checkForUpdate() {
                 try {
