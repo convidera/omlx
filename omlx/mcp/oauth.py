@@ -48,6 +48,9 @@ class MCPOAuthManager:
     Provides:
     - Token retrieval (with automatic refresh on expiry).
     - First-time interactive login (PKCE or Device Auth Grant).
+    - Dynamic Client Registration (RFC 7591 / RFC 8414) when the server
+      advertises a ``registration_endpoint`` and no ``client_id`` is
+      configured (e.g. Notion's remote MCP server).
     - Token revocation / logout.
     - Non-sensitive status reporting (never exposes raw token values).
     """
@@ -60,7 +63,10 @@ class MCPOAuthManager:
     # ------------------------------------------------------------------
 
     async def get_access_token(
-        self, server_name: str, auth_config: MCPAuthConfig
+        self,
+        server_name: str,
+        auth_config: MCPAuthConfig,
+        server_url: Optional[str] = None,
     ) -> Optional[str]:
         """
         Return a valid access token, refreshing it if needed.
@@ -76,7 +82,9 @@ class MCPOAuthManager:
             if token.refresh_token:
                 logger.info("Token expired for '%s', attempting refresh…", server_name)
                 try:
-                    token = await self._do_refresh(auth_config, token.refresh_token)
+                    token = await self._do_refresh(
+                        auth_config, token.refresh_token, stored_token=token
+                    )
                     self._store.save(server_name, token)
                     return token.access_token
                 except Exception as exc:
@@ -96,6 +104,7 @@ class MCPOAuthManager:
         server_name: str,
         auth_config: MCPAuthConfig,
         flow: str = "pkce",
+        server_url: Optional[str] = None,
     ) -> TokenData:
         """
         Perform a full interactive OAuth login.
@@ -104,14 +113,17 @@ class MCPOAuthManager:
             server_name: MCP server name (used as the token store key).
             auth_config: OAuth configuration.
             flow: ``"pkce"`` (default) or ``"device"``.
+            server_url: MCP endpoint URL.  Required for servers that use
+                Dynamic Client Registration (i.e. when ``auth_config`` has
+                no ``client_id``).
 
         Returns:
             The acquired :class:`~omlx.mcp.token_store.TokenData`.
         """
         if flow == "device":
-            token = await self._device_code_flow(server_name, auth_config)
+            token = await self._device_code_flow(server_name, auth_config, server_url)
         else:
-            token = await self._pkce_flow(server_name, auth_config)
+            token = await self._pkce_flow(server_name, auth_config, server_url)
 
         self._store.save(server_name, token)
         logger.info("Successfully authenticated '%s'", server_name)
@@ -145,9 +157,22 @@ class MCPOAuthManager:
     # ------------------------------------------------------------------
 
     async def _pkce_flow(
-        self, server_name: str, auth_config: MCPAuthConfig
+        self,
+        server_name: str,
+        auth_config: MCPAuthConfig,
+        server_url: Optional[str] = None,
     ) -> TokenData:
-        """Run the Authorization Code + PKCE flow."""
+        """Run the Authorization Code + PKCE flow.
+
+        When *auth_config* has no ``client_id``, ``auth_url``, or
+        ``token_url``, the method first performs OAuth 2.0 Authorization
+        Server Metadata discovery (RFC 8414) and then Dynamic Client
+        Registration (RFC 7591) to obtain a ``client_id`` automatically.
+        """
+        auth_url = auth_config.auth_url
+        token_url = auth_config.token_url
+        client_id = auth_config.client_id
+
         code_verifier = _generate_code_verifier()
         code_challenge = _generate_code_challenge(code_verifier)
         state = secrets.token_urlsafe(16)
@@ -155,9 +180,41 @@ class MCPOAuthManager:
         port, code_queue = _start_callback_server()
         redirect_uri = f"http://localhost:{port}/callback"
 
+        # -- DCR / metadata discovery -----------------------------------
+        registered_client_id: Optional[str] = None
+        if not auth_url or not token_url or not client_id:
+            if not server_url:
+                raise OAuthError(
+                    f"MCP server '{server_name}' has no OAuth URLs configured "
+                    "and no server_url was provided for auto-discovery. "
+                    "Either set auth_url/token_url/client_id explicitly, or "
+                    "ensure the server URL is provided."
+                )
+            logger.info(
+                "No full OAuth config for '%s'; discovering via RFC 8414…",
+                server_name,
+            )
+            metadata = await _discover_oauth_metadata(server_url)
+            if not auth_url:
+                auth_url = metadata.get("authorization_endpoint", "")
+            if not token_url:
+                token_url = metadata.get("token_endpoint", "")
+            if not client_id:
+                reg_endpoint = metadata.get("registration_endpoint")
+                if not reg_endpoint:
+                    raise OAuthError(
+                        f"OAuth server for '{server_name}' does not advertise a "
+                        "'registration_endpoint'. Set 'client_id' explicitly in "
+                        "the server's auth config."
+                    )
+                logger.info("Performing Dynamic Client Registration for '%s'…", server_name)
+                client_id = await _register_dynamic_client(reg_endpoint, redirect_uri)
+                registered_client_id = client_id
+        # ---------------------------------------------------------------
+
         params: Dict[str, str] = {
             "response_type": "code",
-            "client_id": auth_config.client_id,
+            "client_id": client_id,
             "redirect_uri": redirect_uri,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
@@ -168,10 +225,10 @@ class MCPOAuthManager:
         if auth_config.audience:
             params["audience"] = auth_config.audience
 
-        auth_url = f"{auth_config.auth_url}?{urlencode(params)}"
+        full_auth_url = f"{auth_url}?{urlencode(params)}"
         print(f"\nOpening browser for MCP authentication ({server_name})…")
-        print(f"If the browser does not open, visit:\n  {auth_url}\n")
-        webbrowser.open(auth_url)
+        print(f"If the browser does not open, visit:\n  {full_auth_url}\n")
+        webbrowser.open(full_auth_url)
 
         try:
             callback_data = await asyncio.wait_for(
@@ -195,9 +252,24 @@ class MCPOAuthManager:
         if not code:
             raise OAuthError("No authorization code received in callback")
 
-        return await self._exchange_code(
-            auth_config, code, redirect_uri, code_verifier
+        # Build a temporary auth_config with the resolved URLs/client_id so
+        # that _exchange_code can use them.
+        resolved_config = MCPAuthConfig(
+            type=auth_config.type,
+            client_id=client_id,
+            auth_url=auth_url,
+            token_url=token_url,
+            scopes=auth_config.scopes,
+            audience=auth_config.audience,
         )
+        token = await self._exchange_code(
+            resolved_config, code, redirect_uri, code_verifier
+        )
+        # Persist the dynamically registered client_id alongside the token
+        # so it can be reused for token refresh without re-registering.
+        if registered_client_id:
+            token.registered_client_id = registered_client_id
+        return token
 
     async def _exchange_code(
         self,
@@ -229,14 +301,40 @@ class MCPOAuthManager:
     # ------------------------------------------------------------------
 
     async def _device_code_flow(
-        self, server_name: str, auth_config: MCPAuthConfig
+        self,
+        server_name: str,
+        auth_config: MCPAuthConfig,
+        server_url: Optional[str] = None,
     ) -> TokenData:
         """Run the Device Authorization Grant flow (RFC 8628)."""
+        client_id = auth_config.client_id
+        token_url = auth_config.token_url
+
+        if not client_id or not token_url:
+            if not server_url:
+                raise OAuthError(
+                    f"MCP server '{server_name}' has no OAuth URLs configured "
+                    "and no server_url was provided for auto-discovery."
+                )
+            metadata = await _discover_oauth_metadata(server_url)
+            if not token_url:
+                token_url = metadata.get("token_endpoint", "")
+            if not client_id:
+                reg_endpoint = metadata.get("registration_endpoint")
+                if not reg_endpoint:
+                    raise OAuthError(
+                        f"OAuth server for '{server_name}' does not advertise a "
+                        "'registration_endpoint'. Set 'client_id' explicitly."
+                    )
+                client_id = await _register_dynamic_client(
+                    reg_endpoint, redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+                )
+
         device_auth_url = auth_config.device_auth_url or _infer_device_auth_url(
-            auth_config.auth_url
+            auth_config.auth_url or token_url
         )
 
-        payload: Dict[str, str] = {"client_id": auth_config.client_id}
+        payload: Dict[str, str] = {"client_id": client_id}
         if auth_config.scopes:
             payload["scope"] = " ".join(auth_config.scopes)
         if auth_config.audience:
@@ -271,11 +369,11 @@ class MCPOAuthManager:
                 await asyncio.sleep(interval)
                 poll_payload = {
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "client_id": auth_config.client_id,
+                    "client_id": client_id,
                     "device_code": device_code,
                 }
                 resp = await client.post(
-                    auth_config.token_url,
+                    token_url,
                     data=poll_payload,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     timeout=30.0,
@@ -303,20 +401,39 @@ class MCPOAuthManager:
     # ------------------------------------------------------------------
 
     async def _do_refresh(
-        self, auth_config: MCPAuthConfig, refresh_token: str
+        self,
+        auth_config: MCPAuthConfig,
+        refresh_token: str,
+        stored_token: Optional[TokenData] = None,
     ) -> TokenData:
-        """Refresh an access token using *refresh_token*."""
+        """Refresh an access token using *refresh_token*.
+
+        When the server used Dynamic Client Registration, the ``client_id``
+        is taken from *stored_token.registered_client_id* if
+        ``auth_config.client_id`` is empty.
+        """
+        client_id = auth_config.client_id
+        if not client_id and stored_token and stored_token.registered_client_id:
+            client_id = stored_token.registered_client_id
+
+        if not client_id:
+            raise OAuthError(
+                "Cannot refresh token: no client_id available. "
+                "Re-authenticate with 'omlx mcp login'."
+            )
+
         payload: Dict[str, str] = {
             "grant_type": "refresh_token",
-            "client_id": auth_config.client_id,
+            "client_id": client_id,
             "refresh_token": refresh_token,
         }
         if auth_config.scopes:
             payload["scope"] = " ".join(auth_config.scopes)
 
+        token_url = auth_config.token_url
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                auth_config.token_url,
+                token_url,
                 data=payload,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=30.0,
@@ -327,6 +444,9 @@ class MCPOAuthManager:
         # Preserve the refresh token if the server did not return a new one
         if not token.refresh_token:
             token.refresh_token = refresh_token
+        # Propagate the registered client_id so it is persisted on re-save
+        if stored_token and stored_token.registered_client_id:
+            token.registered_client_id = stored_token.registered_client_id
         return token
 
 
@@ -417,3 +537,104 @@ def _infer_device_auth_url(auth_url: str) -> str:
     else:
         path = path.rstrip("/") + "/device/code"
     return parsed._replace(path=path).geturl()
+
+
+# ------------------------------------------------------------------
+# OAuth 2.0 Authorization Server Metadata discovery (RFC 8414)
+# and Dynamic Client Registration (RFC 7591)
+# ------------------------------------------------------------------
+
+def _get_discovery_urls(server_url: str) -> list:
+    """
+    Return candidate OAuth AS metadata discovery URLs for *server_url*.
+
+    Per RFC 8414 §3, when the server URL has a path component the
+    discovery document may live at either:
+    ``{scheme}://{authority}/.well-known/oauth-authorization-server{path}``
+    (preferred) or ``{scheme}://{authority}/.well-known/oauth-authorization-server``.
+    OpenID Connect servers additionally publish at
+    ``{scheme}://{authority}/.well-known/openid-configuration``.
+    """
+    parsed = urlparse(server_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+    candidates = []
+    if path and path != "/":
+        candidates.append(f"{base}/.well-known/oauth-authorization-server{path}")
+    candidates.append(f"{base}/.well-known/oauth-authorization-server")
+    candidates.append(f"{base}/.well-known/openid-configuration")
+    return candidates
+
+
+async def _discover_oauth_metadata(server_url: str) -> Dict[str, Any]:
+    """
+    Fetch OAuth 2.0 Authorization Server Metadata (RFC 8414).
+
+    Tries discovery URLs in order and returns the first successful response.
+
+    Raises:
+        OAuthError: When no discovery document can be retrieved.
+    """
+    urls = _get_discovery_urls(server_url)
+    last_exc: Optional[Exception] = None
+    async with httpx.AsyncClient() as client:
+        for url in urls:
+            try:
+                resp = await client.get(url, timeout=10.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    logger.debug("Discovered OAuth metadata at %s", url)
+                    return data
+            except Exception as exc:
+                last_exc = exc
+                logger.debug("Discovery failed at %s: %s", url, exc)
+    raise OAuthError(
+        f"Could not discover OAuth metadata for '{server_url}'. "
+        f"Tried: {', '.join(urls)}. "
+        "Set auth_url/token_url/client_id explicitly in the server's auth config."
+        + (f" Last error: {last_exc}" if last_exc else "")
+    )
+
+
+async def _register_dynamic_client(
+    registration_endpoint: str,
+    redirect_uri: str,
+    client_name: str = "omlx",
+) -> str:
+    """
+    Register a new OAuth 2.0 client via Dynamic Client Registration (RFC 7591).
+
+    Returns the ``client_id`` assigned by the authorization server.
+
+    Raises:
+        OAuthError: When registration fails.
+    """
+    body: Dict[str, Any] = {
+        "client_name": client_name,
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",  # public client — no client secret
+        "code_challenge_methods_supported": ["S256"],
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            registration_endpoint,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        if not resp.is_success:
+            raise OAuthError(
+                f"Dynamic Client Registration failed "
+                f"(HTTP {resp.status_code}): {resp.text[:200]}"
+            )
+        data = resp.json()
+
+    client_id = data.get("client_id")
+    if not client_id:
+        raise OAuthError(
+            "Dynamic Client Registration response did not include 'client_id'"
+        )
+    logger.info("Dynamic Client Registration successful; client_id=%s", client_id)
+    return client_id

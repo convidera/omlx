@@ -322,7 +322,7 @@ async def _mcp_login(args) -> None:
 
     manager = MCPOAuthManager()
     try:
-        token = await manager.login(server_name, server.auth, flow=flow)
+        token = await manager.login(server_name, server.auth, flow=flow, server_url=server.url)
         scope = token.scope or ""
         print(f"\nAuthentication successful for '{server_name}' (scope={scope!r})")
     except Exception as exc:

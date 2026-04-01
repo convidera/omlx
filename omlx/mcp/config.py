@@ -190,21 +190,22 @@ def create_example_config() -> str:
             },
             "notion": {
                 "_comment": (
-                    "Option A: Notion internal integration token (most common). "
-                    "Get your token at https://www.notion.so/profile/integrations"
+                    "Notion remote MCP — uses OAuth 2.1 with Dynamic Client "
+                    "Registration (no client_id needed). "
+                    "Run: omlx mcp login notion"
                 ),
                 "transport": "streamable-http",
                 "url": "https://mcp.notion.com/mcp",
-                "headers": {
-                    "Authorization": "Bearer YOUR_NOTION_INTEGRATION_TOKEN"
-                },
                 "enabled": False,
                 "timeout": 60,
+                "auth": {
+                    "type": "oauth2",
+                }
             },
-            "notion-oauth": {
+            "notion-oauth-app": {
                 "_comment": (
-                    "Option B: Notion public OAuth app "
-                    "- requires a registered OAuth application with client_id"
+                    "Notion public OAuth app "
+                    "- for developers with a registered OAuth application (client_id required)"
                 ),
                 "transport": "streamable-http",
                 "url": "https://mcp.notion.com/mcp",

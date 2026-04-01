@@ -41,10 +41,10 @@ class MCPAuthConfig:
         """Validate OAuth configuration."""
         if self.type != "oauth2":
             raise ValueError(f"Unsupported auth type: '{self.type}'. Only 'oauth2' is supported.")
-        if not self.client_id:
-            raise ValueError("OAuth2 auth config requires 'client_id'")
-        if not self.token_url:
-            raise ValueError("OAuth2 auth config requires 'token_url'")
+        # client_id, auth_url, and token_url may be empty when the server
+        # supports Dynamic Client Registration (RFC 7591 / RFC 8414).  They
+        # will be discovered and set at login time via the server's
+        # /.well-known/oauth-authorization-server metadata document.
 
 
 @dataclass
