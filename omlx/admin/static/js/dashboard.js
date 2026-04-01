@@ -691,29 +691,44 @@
                     const popup = window.open(data.auth_url, '_blank',
                         'width=520,height=680,left=' + (screen.width/2 - 260) + ',top=' + (screen.height/2 - 340));
 
+                    // Poll server status until the server settles out of 'connecting'
+                    // (the reconnect is an asyncio.create_task, so it takes time)
+                    const pollUntilSettled = async () => {
+                        for (let i = 0; i < 12; i++) {
+                            await new Promise(r => setTimeout(r, 1500));
+                            await this.loadMcpServers();
+                            const s = this.mcpServers.find(s => s.name === name);
+                            if (!s || s.state !== 'connecting') break;
+                        }
+                    };
+
                     // Listen for completion via postMessage from the callback page
                     const handler = async (event) => {
                         try {
                             const msg = JSON.parse(event.data);
                             if (msg.type !== 'mcp_oauth_complete') return;
-                            window.removeEventListener('message', handler);
-                            if (popup && !popup.closed) popup.close();
-                            if (msg.success) {
-                                this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'ok', text: 'Authentication successful' } };
-                                await this.loadMcpServers();
-                                setTimeout(() => { this.mcpMessages = { ...this.mcpMessages, [name]: null }; }, 4000);
-                            } else {
-                                this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'error', text: 'Authentication failed' } };
-                            }
-                        } catch(e) {}
+                        } catch(e) { return; }
+                        window.removeEventListener('message', handler);
+                        clearInterval(popupPoller);
+                        if (popup && !popup.closed) popup.close();
+                        if (msg.success) {
+                            this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'ok', text: 'Authenticated — connecting…' } };
+                            await pollUntilSettled();
+                            const s = this.mcpServers.find(s => s.name === name);
+                            const text = s?.state === 'connected' ? 'Connected successfully' : 'Authenticated';
+                            this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'ok', text } };
+                            setTimeout(() => { this.mcpMessages = { ...this.mcpMessages, [name]: null }; }, 4000);
+                        } else {
+                            this.mcpMessages = { ...this.mcpMessages, [name]: { type: 'error', text: 'Authentication failed' } };
+                        }
                         this.mcpActionLoading = { ...this.mcpActionLoading, [name]: null };
                     };
                     window.addEventListener('message', handler);
 
-                    // Fallback: clear loading state if popup is closed without message
-                    const pollClose = setInterval(() => {
+                    // Fallback: if popup closes without a message, still refresh
+                    const popupPoller = setInterval(() => {
                         if (popup && popup.closed) {
-                            clearInterval(pollClose);
+                            clearInterval(popupPoller);
                             window.removeEventListener('message', handler);
                             this.mcpActionLoading = { ...this.mcpActionLoading, [name]: null };
                             this.loadMcpServers();
