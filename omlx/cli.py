@@ -268,8 +268,11 @@ def _mcp_status(args) -> None:
     """Print OAuth auth status for MCP servers."""
     from .mcp.config import load_mcp_config
     from .mcp.oauth import MCPOAuthManager
+    from .settings import GlobalSettings
 
-    config = load_mcp_config(args.mcp_config)
+    settings = GlobalSettings.load()
+    mcp_config = args.mcp_config or settings.mcp.config_path
+    config = load_mcp_config(mcp_config)
     if not config.servers:
         print("No MCP servers configured.")
         return
@@ -301,11 +304,14 @@ async def _mcp_login(args) -> None:
 
     from .mcp.config import load_mcp_config
     from .mcp.oauth import MCPOAuthManager
+    from .settings import GlobalSettings
 
     server_name: str = args.server
     flow: str = args.flow
 
-    config = load_mcp_config(args.mcp_config)
+    settings = GlobalSettings.load()
+    mcp_config = args.mcp_config or settings.mcp.config_path
+    config = load_mcp_config(mcp_config)
 
     if server_name not in config.servers:
         print(f"Unknown MCP server: '{server_name}'")
@@ -336,10 +342,13 @@ def _mcp_logout(args) -> None:
 
     from .mcp.config import load_mcp_config
     from .mcp.oauth import MCPOAuthManager
+    from .settings import GlobalSettings
 
     server_name: str = args.server
 
-    config = load_mcp_config(args.mcp_config)
+    settings = GlobalSettings.load()
+    mcp_config = args.mcp_config or settings.mcp.config_path
+    config = load_mcp_config(mcp_config)
     if server_name not in config.servers:
         print(f"Unknown MCP server: '{server_name}'")
         sys.exit(1)
