@@ -4749,18 +4749,25 @@ async def start_mcp_authenticate(name: str, request: Request, is_admin: bool = D
         if not token_url:
             token_url = metadata.get("token_endpoint", "")
         if not client_id:
-            reg_endpoint = metadata.get("registration_endpoint")
-            if not reg_endpoint:
-                raise HTTPException(
-                    status_code=400,
-                    detail="OAuth server does not advertise a registration_endpoint. "
-                    "Set client_id explicitly in the server auth config.",
-                )
-            try:
-                client_id = await _register_dynamic_client(reg_endpoint, redirect_uri)
+            # Reuse a previously registered client_id if available (avoid redundant DCR)
+            from ..mcp.token_store import TokenStore
+            existing_token = TokenStore(cfg.auth.token_store if cfg.auth else None).load(name)
+            if existing_token and existing_token.registered_client_id:
+                client_id = existing_token.registered_client_id
                 registered_client_id = client_id
-            except Exception as exc:
-                raise HTTPException(status_code=502, detail=f"Dynamic Client Registration failed: {exc}")
+            else:
+                reg_endpoint = metadata.get("registration_endpoint")
+                if not reg_endpoint:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="OAuth server does not advertise a registration_endpoint. "
+                        "Set client_id explicitly in the server auth config.",
+                    )
+                try:
+                    client_id = await _register_dynamic_client(reg_endpoint, redirect_uri)
+                    registered_client_id = client_id
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"Dynamic Client Registration failed: {exc}")
 
     code_verifier = _generate_code_verifier()
     code_challenge = _generate_code_challenge(code_verifier)
@@ -4849,6 +4856,8 @@ async def mcp_oauth_callback(
         )
         if session.get("registered_client_id"):
             token.registered_client_id = session["registered_client_id"]
+        if session.get("token_url"):
+            token.token_url = session["token_url"]
 
         TokenStore().save(session["server_name"], token)
         logger.info("MCP OAuth complete for server '%s'", session["server_name"])
