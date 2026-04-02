@@ -431,6 +431,14 @@ class MCPOAuthManager:
             payload["scope"] = " ".join(auth_config.scopes)
 
         token_url = auth_config.token_url
+        if not token_url and stored_token and stored_token.token_url:
+            token_url = stored_token.token_url
+        if not token_url:
+            raise OAuthError(
+                "Cannot refresh token: no token_url available. "
+                "Re-authenticate with 'omlx mcp login'."
+            )
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 token_url,
@@ -447,6 +455,9 @@ class MCPOAuthManager:
         # Propagate the registered client_id so it is persisted on re-save
         if stored_token and stored_token.registered_client_id:
             token.registered_client_id = stored_token.registered_client_id
+        # Propagate the discovered token_url so refresh keeps working
+        if stored_token and stored_token.token_url:
+            token.token_url = stored_token.token_url
         return token
 
 

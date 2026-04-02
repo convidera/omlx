@@ -2092,15 +2092,15 @@ async def create_chat_completion(
             # Append tool result turns
             for result_msg in tool_result_msgs:
                 msg = dict(result_msg)
-                # Harmony chat_template applies |tojson to content — keep as dict/list.
-                # Guard against json.loads returning None (e.g. "null") which would
-                # cause a TypeError in Jinja2 `in` containment checks on the template.
+                # Harmony chat_template applies |tojson to content — keep as dict.
+                # Only unpack JSON objects (dicts); lists and scalars stay as JSON
+                # strings to avoid the Jinja2 |items filter failing on non-mappings.
                 if engine.model_type == "gpt_oss":
                     content = msg.get("content", "")
                     if isinstance(content, str):
                         try:
                             parsed = json.loads(content)
-                            if parsed is not None:
+                            if isinstance(parsed, dict):
                                 msg["content"] = parsed
                         except (json.JSONDecodeError, ValueError):
                             pass
@@ -2787,15 +2787,15 @@ async def stream_chat_completion(
             # Append tool result turns
             for result_msg in tool_result_msgs:
                 msg = dict(result_msg)
-                # Harmony chat_template applies |tojson to content — keep as dict/list.
-                # Guard against json.loads returning None (e.g. "null") which would
-                # cause a TypeError in Jinja2 `in` containment checks on the template.
+                # Harmony chat_template applies |tojson to content — keep as dict.
+                # Only unpack JSON objects (dicts); lists and scalars stay as JSON
+                # strings to avoid the Jinja2 |items filter failing on non-mappings.
                 if engine.model_type == "gpt_oss":
                     content_val = msg.get("content", "")
                     if isinstance(content_val, str):
                         try:
                             parsed = json.loads(content_val)
-                            if parsed is not None:
+                            if isinstance(parsed, dict):
                                 msg["content"] = parsed
                         except (json.JSONDecodeError, ValueError):
                             pass

@@ -36,6 +36,9 @@ class TokenData:
     # Persisted client_id obtained via Dynamic Client Registration (DCR).
     # Set when the server uses RFC 7591 auto-registration (e.g. Notion remote MCP).
     registered_client_id: Optional[str] = None
+    # Token endpoint URL discovered via RFC 8414 metadata.
+    # Persisted so token refresh works even when auth_config.token_url is empty.
+    token_url: Optional[str] = None
 
     @property
     def is_expired(self) -> bool:
