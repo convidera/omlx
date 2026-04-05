@@ -1478,7 +1478,7 @@
                             messages: messagesForApi,
                             stream: true,
                             stream_options: { include_usage: true },
-                            execute_mcp_tools: true
+                            ...(this.mcpTools.length > 0 && { tools: this.mcpTools })
                         }),
                         signal: this.abortController.signal
                     });
@@ -1531,6 +1531,32 @@
                                         this.streamingContent += `<tooluse>${JSON.stringify(delta.tool_call_event)}</tooluse>`;
                                         this.updateStreamingDOM();
                                         this.scrollToBottom();
+                                    }
+
+                                    if (delta?.tool_calls) {
+                                        if (!firstToken) { firstToken = true; this.stopPrefillPolling(); }
+                                        for (const tc of delta.tool_calls) {
+                                            const i = tc.index ?? 0;
+                                            if (!toolCallsMap[i]) toolCallsMap[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+                                            if (tc.id) toolCallsMap[i].id = tc.id;
+                                            if (tc.function?.name) toolCallsMap[i].function.name += tc.function.name;
+                                            if (tc.function?.arguments) toolCallsMap[i].function.arguments += tc.function.arguments;
+                                        }
+                                        // Clear any pre-tool streaming content (e.g. thinking tokens)
+                                        if (this.streamingContent) {
+                                            this.streamingContent = '';
+                                            this.thinkingState.isInThinking = false;
+                                            this.thinkingState.thinkingStartTime = null;
+                                        }
+                                        // Update live status with tool names as they stream in
+                                        const names = Object.values(toolCallsMap).map(t => t.function.name).filter(Boolean);
+                                        if (names.length > 0) {
+                                            const unique = [...new Set(names)];
+                                            const liveLabel = names.length > 3
+                                                ? `Calling ${unique.slice(0, 2).join(', ')} +${names.length - 2} more`
+                                                : `Calling ${names.join(', ')}`;
+                                            this.engineStatus = { text: liveLabel, icon: 'wrench' };
+                                        }
                                     }
 
                                     if (delta?.reasoning_content) {

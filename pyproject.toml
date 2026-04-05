@@ -62,6 +62,8 @@ dependencies = [
     # mlx-vlm from commit (90732bd) - optimized TurboQuant Metal kernels (0.85-1.90x baseline)
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@90732bdee6a361ae5003b180dc3c1b17b9d01a80",
     "Pillow>=9.0.0",
+    "ddgs>=9.12.1",
+    "truststore>=0.10.4",
 ]
 
 [project.optional-dependencies]
