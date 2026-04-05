@@ -516,7 +516,7 @@ def build_venvstacks():
     # _lock_with_sdist_retry() builds them locally and retries automatically.
     print("\n  Locking environments...")
     lock_cmd = [
-        "pipx", "run", "venvstacks", "lock",
+        "uvx", "venvstacks", "lock",
         str(resolved_toml),
     ] + local_wheels_args
     if version_map:
@@ -529,7 +529,7 @@ def build_venvstacks():
     # Step 4: Build environments
     print("\n  Building environments (this may take a while)...")
     run_cmd([
-        "pipx", "run", "venvstacks", "build",
+        "uvx", "venvstacks", "build",
         str(resolved_toml),
         "--no-lock",
     ] + local_wheels_args)
@@ -540,7 +540,7 @@ def build_venvstacks():
         shutil.rmtree(EXPORT_DIR)
 
     run_cmd([
-        "pipx", "run", "venvstacks", "local-export",
+        "uvx", "venvstacks", "local-export",
         str(resolved_toml),
         "--output-dir", str(EXPORT_DIR),
     ])

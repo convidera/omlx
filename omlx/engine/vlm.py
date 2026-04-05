@@ -461,73 +461,9 @@ class VLMBatchedEngine(BaseEngine):
         logger.info("VLMBatchedEngine stopped")
 
     def _inject_tool_calling(self, tokenizer) -> None:
-        """Inject tool calling attributes into VLM tokenizer.
-
-        mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We prefer mlx_vlm.tool_parsers which is a superset of
-        mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
-        and loads the correct per-model parser.  Falls back to mlx_lm if the
-        mlx_vlm.tool_parsers package is not present.
-        """
-        chat_template = getattr(tokenizer, "chat_template", None)
-        if not chat_template:
-            return
-
-        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
-        try:
-            from mlx_vlm.tool_parsers import (
-                _infer_tool_parser,
-                load_tool_module,
-            )
-
-            tool_parser_type = _infer_tool_parser(chat_template)
-            if tool_parser_type is None:
-                return
-            try:
-                tool_module = load_tool_module(tool_parser_type)
-            except ImportError:
-                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
-                return
-        except ImportError:
-            # Fallback: mlx_lm only (no Gemma4 support)
-            try:
-                import importlib
-
-                from mlx_lm.tokenizer_utils import (
-                    _infer_tool_parser as _mlx_lm_infer,
-                )
-            except ImportError:
-                return
-            tool_parser_type = _mlx_lm_infer(chat_template)
-            if tool_parser_type is None:
-                return
-            try:
-                tool_module = importlib.import_module(
-                    f"mlx_lm.tool_parsers.{tool_parser_type}"
-                )
-            except ImportError:
-                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
-                return
-
-        tool_call_start = tool_module.tool_call_start
-        tool_call_end = tool_module.tool_call_end
-
-        # Validate tokens exist in vocab (same check as mlx-lm)
-        vocab = tokenizer.get_vocab()
-        if (tool_call_start and tool_call_start not in vocab) or (
-            tool_call_end and tool_call_end not in vocab
-        ):
-            return
-
-        # Set instance attributes on the mlx-vlm TokenizerWrapper.
-        # Python's __getattr__ is only called when normal lookup fails,
-        # so instance attributes take precedence over delegation to HF tokenizer.
-        tokenizer.has_tool_calling = True
-        tokenizer.tool_call_start = tool_call_start
-        tokenizer.tool_call_end = tool_call_end
-        tokenizer.tool_parser = tool_module.parse_tool_call
-
-        logger.info(f"VLM tool calling enabled: parser={tool_parser_type}")
+        """Inject tool calling attributes into VLM tokenizer."""
+        from ..utils.tokenizer import inject_tool_calling
+        inject_tool_calling(tokenizer)
 
     @staticmethod
     def _count_content_parts(content: Any, part_types: set[str]) -> int:

@@ -168,6 +168,102 @@ def get_tokenizer_config(
     return config
 
 
+def inject_tool_calling(tokenizer) -> None:
+    """Inject tool calling attributes into a tokenizer that lacks them.
+
+    mlx-lm's TokenizerWrapper sets ``has_tool_calling`` for some models but not
+    all (e.g. Gemma 4 reports False even though the model supports tool calls).
+    This function uses mlx_vlm.tool_parsers (superset, knows Gemma4) or falls
+    back to mlx_lm.tokenizer_utils to detect and inject the right parser.
+
+    Skips injection if the tokenizer already has ``has_tool_calling = True``.
+    """
+    if getattr(tokenizer, "has_tool_calling", False):
+        return
+
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if not chat_template:
+        return
+
+    tool_module = None
+
+    # Prefer mlx_vlm.tool_parsers — superset that knows about Gemma4 etc.
+    try:
+        from mlx_vlm.tool_parsers import _infer_tool_parser, load_tool_module
+
+        tool_parser_type = _infer_tool_parser(chat_template)
+        if tool_parser_type:
+            try:
+                tool_module = load_tool_module(tool_parser_type)
+            except ImportError:
+                logger.warning(f"Tool parser module not found: {tool_parser_type}")
+    except ImportError:
+        pass
+
+    # Fallback: mlx_lm.tokenizer_utils
+    if tool_module is None:
+        try:
+            import importlib
+            from mlx_lm.tokenizer_utils import _infer_tool_parser as _mlx_lm_infer
+
+            tool_parser_type = _mlx_lm_infer(chat_template)
+            if tool_parser_type:
+                try:
+                    tool_module = importlib.import_module(
+                        f"mlx_lm.tool_parsers.{tool_parser_type}"
+                    )
+                except ImportError:
+                    logger.warning(f"Tool parser module not found: {tool_parser_type}")
+        except ImportError:
+            pass
+
+    if tool_module is None:
+        return
+
+    tool_call_start = getattr(tool_module, "tool_call_start", None)
+    tool_call_end = getattr(tool_module, "tool_call_end", None)
+
+    # Validate tokens exist in vocab
+    try:
+        vocab = tokenizer.get_vocab()
+        if (tool_call_start and tool_call_start not in vocab) or (
+            tool_call_end and tool_call_end not in vocab
+        ):
+            logger.warning(
+                f"Tool call tokens not in vocab: start={tool_call_start!r} end={tool_call_end!r}"
+            )
+            return
+    except Exception:
+        pass
+
+    parse_fn = tool_module.parse_tool_call
+
+    # The mlx_vlm gemma4 parser uses \w+ in its regex which does not match
+    # hyphenated tool names (e.g. "notion-search").  Patch the module-level
+    # regex in-place so all callers benefit.
+    if tool_parser_type == "gemma4" and hasattr(tool_module, "_tool_call_regex"):
+        import regex as _re
+        tool_module._tool_call_regex = _re.compile(
+            r"call:([\w-]+)(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})"
+        )
+
+    # mlx-lm TokenizerWrapper exposes has_tool_calling / tool_call_start /
+    # tool_call_end / tool_parser as @property backed by _tool_* private attrs.
+    # mlx-vlm's wrapper uses plain instance attributes.  We try the private
+    # attrs first; fall back to direct assignment for other wrapper types.
+    if hasattr(tokenizer, "_tool_call_start"):
+        tokenizer._tool_call_start = tool_call_start
+        tokenizer._tool_call_end = tool_call_end
+        tokenizer._tool_parser = parse_fn
+    else:
+        tokenizer.has_tool_calling = True
+        tokenizer.tool_call_start = tool_call_start
+        tokenizer.tool_call_end = tool_call_end
+        tokenizer.tool_parser = parse_fn
+
+    logger.info(f"Tool calling enabled via inject: parser={tool_parser_type}")
+
+
 def apply_qwen3_fix(
     tokenizer_config: dict[str, Any],
     model_name: str,

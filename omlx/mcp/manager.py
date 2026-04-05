@@ -8,6 +8,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
+from .builtins import BuiltinToolProvider
 from .client import MCPClient
 from .tools import merge_tools, mcp_tools_to_openai, openai_call_to_mcp
 from .types import (
@@ -42,6 +43,7 @@ class MCPClientManager:
         self._clients: Dict[str, MCPClient] = {}
         self._started = False
         self._lock = asyncio.Lock()
+        self._builtins = BuiltinToolProvider()
 
         # Create clients for each server
         for name, server_config in config.servers.items():
@@ -112,12 +114,12 @@ class MCPClientManager:
 
     def get_all_tools(self) -> List[MCPTool]:
         """
-        Get all tools from all connected servers.
+        Get all tools from built-ins and all connected servers.
 
         Returns:
             List of MCPTool instances
         """
-        tools = []
+        tools = list(self._builtins.get_tools())
         for client in self._clients.values():
             if client.is_connected:
                 tools.extend(client.tools)
@@ -205,6 +207,10 @@ class MCPClientManager:
                 error_message=f"Tool '{full_name}' not found in any connected server",
             )
 
+        # Route to built-in provider
+        if server_name == "builtin":
+            return await self._builtins.execute(tool_name, arguments)
+
         # Get client
         client = self._clients.get(server_name)
         if not client:
@@ -264,6 +270,9 @@ class MCPClientManager:
         Returns:
             Server name or None if not found
         """
+        for tool in self._builtins.get_tools():
+            if tool.name == tool_name:
+                return "builtin"
         for client in self._clients.values():
             if client.is_connected:
                 for tool in client.tools:
