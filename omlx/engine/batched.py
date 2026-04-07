@@ -214,11 +214,6 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), _load_model_sync
         )
 
-        # Inject tool calling support for models whose tokenizer doesn't set it
-        # (e.g. Gemma 4 reports has_tool_calling=False despite supporting tools).
-        from ..utils.tokenizer import inject_tool_calling
-        inject_tool_calling(self._tokenizer)
-
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import apply_post_load_transforms
 
