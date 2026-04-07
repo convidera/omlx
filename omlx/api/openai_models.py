@@ -187,6 +187,8 @@ class ChatCompletionRequest(BaseModel):
     # and returns the final model response. When False (default) tool_calls are
     # returned to the client for it to handle.
     execute_mcp_tools: bool = False
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -260,6 +262,8 @@ class CompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # Seed for reproducible generation (best-effort)
+    seed: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod

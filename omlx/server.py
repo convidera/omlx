@@ -1046,7 +1046,7 @@ def init_server(
             logger.info("Generated and saved new auth secret key")
         from .admin.auth import init_auth
 
-        init_auth(global_settings.auth.secret_key)
+        init_auth(global_settings.auth.secret_key, lambda: _server_state.global_settings)
 
     # Configure CORS middleware from settings
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
@@ -1751,6 +1751,7 @@ async def create_completion(
                 xtc_probability=xtc_probability,
                 xtc_threshold=xtc_threshold,
                 stop=request.stop,
+                seed=request.seed,
             ),
         )
         if output is None:
@@ -1941,6 +1942,10 @@ async def create_chat_completion(
         "xtc_probability": xtc_probability,
         "xtc_threshold": xtc_threshold,
     }
+
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
 
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(request, request.model)
@@ -2446,6 +2451,7 @@ async def stream_completion(
             xtc_probability=xtc_probability,
             xtc_threshold=xtc_threshold,
             stop=request.stop,
+            seed=request.seed,
         ):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
@@ -3757,6 +3763,10 @@ async def create_response(
         "xtc_probability": xtc_probability,
         "xtc_threshold": xtc_threshold,
     }
+
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
 
     # Add thinking budget if applicable
     thinking_budget = _resolve_thinking_budget(request, request.model)
