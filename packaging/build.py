@@ -263,6 +263,19 @@ def _find_target_python() -> str:
     return sys.executable
 
 
+def _ensure_pip(python: str) -> None:
+    """Ensure pip is available in the given Python interpreter."""
+    check = subprocess.run(
+        [python, "-m", "pip", "--version"],
+        capture_output=True,
+    )
+    if check.returncode != 0:
+        subprocess.run(
+            [python, "-m", "ensurepip", "--upgrade"],
+            capture_output=True,
+        )
+
+
 def _build_sdist_wheel(pkg_name: str) -> bool:
     """Build a wheel for a sdist-only package into _wheels/.
 
@@ -270,6 +283,7 @@ def _build_sdist_wheel(pkg_name: str) -> bool:
     Returns True if the wheel was built successfully.
     """
     target_python = _find_target_python()
+    _ensure_pip(target_python)
     print(f"  Building wheel for {pkg_name} (sdist-only, using {target_python})...")
     result = subprocess.run(
         [target_python, "-m", "pip", "wheel", pkg_name, "--no-deps",
