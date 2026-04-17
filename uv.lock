@@ -916,6 +916,15 @@ wheels = [
 ]
 
 [[package]]
+name = "dflash-mlx"
+version = "0.1.0"
+source = { git = "https://github.com/jundot/dflash-mlx?rev=8e1df22#8e1df22796e3918a4812bc0b2a9fe8f13ac476c9" }
+dependencies = [
+    { name = "mlx" },
+    { name = "mlx-lm" },
+]
+
+[[package]]
 name = "dill"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1883,8 +1892,8 @@ wheels = [
 
 [[package]]
 name = "mlx-audio"
-version = "0.4.1"
-source = { git = "https://github.com/Blaizzy/mlx-audio?rev=6408d2a410eb8c57464e07725b92271860199250#6408d2a410eb8c57464e07725b92271860199250" }
+version = "0.4.3"
+source = { git = "https://github.com/Blaizzy/mlx-audio?rev=51753266e0a4f766fd5e6fbc46652224efc23981#51753266e0a4f766fd5e6fbc46652224efc23981" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "librosa" },
@@ -1970,7 +1979,7 @@ wheels = [
 [[package]]
 name = "mlx-vlm"
 version = "0.4.4"
-source = { git = "https://github.com/Blaizzy/mlx-vlm?rev=23e1dffd224488141a4f022b6d21d6a730f11507#23e1dffd224488141a4f022b6d21d6a730f11507" }
+source = { git = "https://github.com/Blaizzy/mlx-vlm?rev=3472132fe6ee7beeae2c2fc35923eaed2e734b3d#3472132fe6ee7beeae2c2fc35923eaed2e734b3d" }
 dependencies = [
     { name = "datasets" },
     { name = "fastapi" },
@@ -2756,6 +2765,7 @@ name = "omlx"
 source = { editable = "." }
 dependencies = [
     { name = "ddgs" },
+    { name = "dflash-mlx" },
     { name = "fastapi" },
     { name = "huggingface-hub" },
     { name = "itsdangerous" },
@@ -2822,6 +2832,7 @@ dev = [
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
     { name = "ddgs", specifier = ">=9.12.1" },
+    { name = "dflash-mlx", git = "https://github.com/jundot/dflash-mlx?rev=8e1df22" },
     { name = "fastapi", specifier = ">=0.108.0" },
     { name = "huggingface-hub", specifier = ">=0.23.0" },
     { name = "itsdangerous", specifier = ">=2.0" },
@@ -2830,10 +2841,10 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0.0" },
     { name = "mlx", specifier = ">=0.31.1" },
-    { name = "mlx-audio", extras = ["sts", "stt", "tts"], marker = "extra == 'audio'", git = "https://github.com/Blaizzy/mlx-audio?rev=6408d2a410eb8c57464e07725b92271860199250" },
+    { name = "mlx-audio", extras = ["sts", "stt", "tts"], marker = "extra == 'audio'", git = "https://github.com/Blaizzy/mlx-audio?rev=51753266e0a4f766fd5e6fbc46652224efc23981" },
     { name = "mlx-embeddings", git = "https://github.com/Blaizzy/mlx-embeddings?rev=32981fa4e8064ed664b52071789dd18271fe4206" },
     { name = "mlx-lm", git = "https://github.com/ml-explore/mlx-lm?rev=dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7" },
-    { name = "mlx-vlm", git = "https://github.com/Blaizzy/mlx-vlm?rev=23e1dffd224488141a4f022b6d21d6a730f11507" },
+    { name = "mlx-vlm", git = "https://github.com/Blaizzy/mlx-vlm?rev=3472132fe6ee7beeae2c2fc35923eaed2e734b3d" },
     { name = "modelscope", marker = "extra == 'modelscope'", specifier = ">=1.10.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=1.24.0" },

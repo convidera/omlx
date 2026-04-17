@@ -1277,6 +1277,10 @@ def main():
     print(f"Building {APP_NAME} v{VERSION}")
     print("=" * 50)
 
+    # Ensure pip is available in the current interpreter — uv environments
+    # don't include pip by default, but we invoke it directly in several places.
+    _ensure_pip(sys.executable)
+
     # Clean build artifacts before starting (unless dmg-only)
     if not args.dmg_only:
         clean_all(preserve_venv=args.skip_venv)
