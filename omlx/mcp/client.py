@@ -21,6 +21,12 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 
+def _is_auth_failure(exc: Exception) -> bool:
+    """Return True when *exc* represents an HTTP 401 / unauthorized error."""
+    msg = str(exc).lower()
+    return "401" in msg or "unauthorized" in msg
+
+
 class MCPClient:
     """
     Client for connecting to a single MCP server.
@@ -44,6 +50,7 @@ class MCPClient:
         self._error: Optional[str] = None
         self._last_connected: Optional[float] = None
         self._lock = asyncio.Lock()
+        self._transport_tasks: List = []  # list of (task, disconnect_event)
 
     @property
     def name(self) -> str:
@@ -67,6 +74,18 @@ class MCPClient:
 
     def get_status(self) -> MCPServerStatus:
         """Get server status."""
+        auth_state: Optional[str] = None
+        if self.config.auth:
+            from .oauth import MCPOAuthManager  # lazy import
+            manager = MCPOAuthManager()
+            info = manager.get_token_info(self.name)
+            if info is None:
+                auth_state = "not_authenticated"
+            elif info.get("is_expired"):
+                auth_state = "token_expired"
+            else:
+                auth_state = "authenticated"
+
         return MCPServerStatus(
             name=self.name,
             state=self._state,
@@ -74,11 +93,16 @@ class MCPClient:
             tools_count=len(self._tools),
             error=self._error,
             last_connected=self._last_connected,
+            auth_state=auth_state,
         )
 
     async def connect(self) -> bool:
         """
         Connect to the MCP server.
+
+        For HTTP-based transports configured with OAuth, the client will
+        attempt to acquire / refresh a token before connecting and retry
+        once if the server returns a 401.
 
         Returns:
             True if connection successful, False otherwise
@@ -95,35 +119,172 @@ class MCPClient:
             self._error = None
 
             try:
-                if self.config.transport == MCPTransport.STDIO:
-                    await self._connect_stdio()
-                elif self.config.transport == MCPTransport.SSE:
-                    await self._connect_sse()
-                elif self.config.transport == MCPTransport.STREAMABLE_HTTP:
-                    await self._connect_streamable_http()
+                # Eagerly fetch a stored / refreshed token for HTTP transports.
+                if self.config.auth and self.config.transport in (
+                    MCPTransport.SSE,
+                    MCPTransport.STREAMABLE_HTTP,
+                ):
+                    token = await self._get_oauth_token()
+                    if token:
+                        self._inject_auth_header(token)
+
+                await self._do_connect()
+
+            except Exception as first_exc:
+                # On auth failure, try to obtain a fresh token and retry once.
+                if self.config.auth and _is_auth_failure(first_exc):
+                    logger.info(
+                        f"MCP server '{self.name}' returned 401; "
+                        "attempting to refresh auth token and retry"
+                    )
+                    try:
+                        token = await self._get_oauth_token(force_refresh=True)
+                        if token:
+                            self._inject_auth_header(token)
+                            await self._cleanup_resources()
+                            await self._do_connect()
+                        else:
+                            raise RuntimeError(
+                                f"No valid OAuth token available for '{self.name}'. "
+                                "Run 'omlx mcp login' to authenticate."
+                            ) from first_exc
+                    except Exception as retry_exc:
+                        self._state = MCPServerState.ERROR
+                        self._error = str(retry_exc)
+                        logger.error(
+                            f"Failed to connect to MCP server '{self.name}' "
+                            f"after auth retry: {retry_exc}"
+                        )
+                        await self._cleanup_resources()
+                        return False
                 else:
-                    raise ValueError(f"Unknown transport: {self.config.transport}")
+                    self._state = MCPServerState.ERROR
+                    self._error = str(first_exc)
+                    logger.error(
+                        f"Failed to connect to MCP server '{self.name}': {first_exc}"
+                    )
+                    await self._cleanup_resources()
+                    return False
 
-                # Initialize session
-                await self._initialize_session()
+            self._state = MCPServerState.CONNECTED
+            self._last_connected = time.time()
+            auth_note = " (authenticated)" if self.config.auth else ""
+            logger.info(
+                f"Connected to MCP server '{self.name}'{auth_note} "
+                f"({len(self._tools)} tools available)"
+            )
+            return True
 
-                # Discover tools
-                await self._discover_tools()
+    async def _do_connect(self) -> None:
+        """Establish the transport connection and discover tools."""
+        if self.config.transport == MCPTransport.STDIO:
+            await self._connect_stdio()
+        elif self.config.transport == MCPTransport.SSE:
+            await self._connect_sse()
+        elif self.config.transport == MCPTransport.STREAMABLE_HTTP:
+            await self._connect_streamable_http()
+        else:
+            raise ValueError(f"Unknown transport: {self.config.transport}")
 
-                self._state = MCPServerState.CONNECTED
-                self._last_connected = time.time()
-                logger.info(
-                    f"Connected to MCP server '{self.name}' "
-                    f"({len(self._tools)} tools available)"
-                )
-                return True
+        await self._initialize_session()
+        await self._discover_tools()
 
-            except Exception as e:
-                self._state = MCPServerState.ERROR
-                self._error = str(e)
-                logger.error(f"Failed to connect to MCP server '{self.name}': {e}")
-                await self._cleanup_resources()
-                return False
+    async def _get_oauth_token(
+        self, force_refresh: bool = False
+    ) -> Optional[str]:
+        """
+        Retrieve an OAuth access token for this server.
+
+        When *force_refresh* is True and a refresh token is available the
+        stored token is refreshed before returning.
+        """
+        if self.config.auth is None:
+            return None
+
+        from .oauth import MCPOAuthManager  # lazy import
+
+        manager = MCPOAuthManager()
+
+        if force_refresh:
+            from .token_store import TokenStore  # lazy import
+            store = TokenStore(self.config.auth.token_store)
+            existing = store.load(self.name)
+            if existing and existing.refresh_token:
+                try:
+                    refreshed = await manager._do_refresh(
+                        self.config.auth, existing.refresh_token, stored_token=existing
+                    )
+                    store.save(self.name, refreshed)
+                    return refreshed.access_token
+                except Exception as exc:
+                    logger.warning(
+                        f"Force-refresh failed for '{self.name}': {exc}"
+                    )
+                    return None
+
+        return await manager.get_access_token(self.name, self.config.auth, server_url=self.config.url)
+
+    def _inject_auth_header(self, token: str) -> None:
+        """Add / replace the Bearer token in the server's headers dict."""
+        if self.config.headers is None:
+            self.config.headers = {}
+        self.config.headers["Authorization"] = f"Bearer {token}"
+
+    async def _run_transport_in_task(self, cm, streams_future: asyncio.Future, disconnect_event: asyncio.Event, nstreams: int = 2):
+        """
+        Enter *cm* (a transport context manager) inside this asyncio Task,
+        hand the resulting streams back via *streams_future*, then hold the
+        connection open until *disconnect_event* is set.
+
+        Running the context manager entirely within a single Task keeps
+        anyio cancel-scopes satisfied — they require __aexit__ to be called
+        from the same task as __aenter__.
+        """
+        try:
+            result = await cm.__aenter__()
+            streams = result[:nstreams] if nstreams < len(result) else result
+            streams_future.set_result(streams)
+            await disconnect_event.wait()
+        except Exception as exc:
+            if not streams_future.done():
+                streams_future.set_exception(exc)
+        finally:
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.debug("Transport __aexit__ raised (expected on cancel): %s", exc)
+
+    async def _start_transport_task(self, cm, nstreams: int = 2):
+        """
+        Spawn a background Task for *cm*, wait for streams to be ready, and
+        return them.  Stores the task and disconnect event on *self* so that
+        _cleanup_resources can tear it down gracefully.
+        """
+        loop = asyncio.get_event_loop()
+        streams_future: asyncio.Future = loop.create_future()
+        disconnect_event = asyncio.Event()
+
+        task = asyncio.create_task(
+            self._run_transport_in_task(cm, streams_future, disconnect_event, nstreams)
+        )
+        try:
+            streams = await asyncio.wait_for(
+                asyncio.shield(streams_future),
+                timeout=self.config.timeout,
+            )
+        except Exception:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
+
+        # Store so _cleanup_resources can signal teardown
+        if not hasattr(self, "_transport_tasks"):
+            self._transport_tasks = []
+        self._transport_tasks.append((task, disconnect_event))
+        return streams
 
     async def _connect_stdio(self):
         """Connect via stdio transport."""
@@ -140,18 +301,11 @@ class MCPClient:
             args=self.config.args or [],
             env=self.config.env,
         )
-
-        # Create stdio client context
-        self._stdio_client = stdio_client(server_params)
-        self._read, self._write = await self._stdio_client.__aenter__()
-
-        try:
-            self._session = ClientSession(self._read, self._write)
-            await self._session.__aenter__()
-        except Exception:
-            await self._stdio_client.__aexit__(None, None, None)
-            self._stdio_client = None
-            raise
+        self._read, self._write = await self._start_transport_task(
+            stdio_client(server_params), nstreams=2
+        )
+        self._session = ClientSession(self._read, self._write)
+        await self._session.__aenter__()
 
     async def _connect_sse(self):
         """Connect via SSE transport."""
@@ -163,17 +317,12 @@ class MCPClient:
                 "MCP SDK required for MCP support. Install with: pip install mcp"
             )
 
-        # Create SSE client context
-        self._sse_client = sse_client(self.config.url)
-        self._read, self._write = await self._sse_client.__aenter__()
-
-        try:
-            self._session = ClientSession(self._read, self._write)
-            await self._session.__aenter__()
-        except Exception:
-            await self._sse_client.__aexit__(None, None, None)
-            self._sse_client = None
-            raise
+        headers = self.config.headers or {}
+        self._read, self._write = await self._start_transport_task(
+            sse_client(self.config.url, headers=headers), nstreams=2
+        )
+        self._session = ClientSession(self._read, self._write)
+        await self._session.__aenter__()
 
     async def _connect_streamable_http(self):
         """Connect via streamable_http transport."""
@@ -187,26 +336,14 @@ class MCPClient:
             )
 
         headers = self.config.headers or {}
-        self._http_client = httpx.AsyncClient(headers=headers)
-        await self._http_client.__aenter__()
-
-        try:
-            self._streamable_http_client = streamable_http_client(
-                url=self.config.url, http_client=self._http_client
-            )
-            self._read, self._write, _ = await self._streamable_http_client.__aenter__()
-            self._session = ClientSession(self._read, self._write)
-            await self._session.__aenter__()
-        except Exception:
-            if (
-                hasattr(self, "_streamable_http_client")
-                and self._streamable_http_client
-            ):
-                await self._streamable_http_client.__aexit__(None, None, None)
-                self._streamable_http_client = None
-            await self._http_client.__aexit__(None, None, None)
-            self._http_client = None
-            raise
+        http_client = httpx.AsyncClient(headers=headers)
+        # nstreams=2: streamable_http_client yields (read, write, get_session_id)
+        self._read, self._write = await self._start_transport_task(
+            streamable_http_client(url=self.config.url, http_client=http_client),
+            nstreams=2,
+        )
+        self._session = ClientSession(self._read, self._write)
+        await self._session.__aenter__()
 
     async def _initialize_session(self):
         """Initialize the MCP session."""
@@ -250,27 +387,21 @@ class MCPClient:
         """Clean up connection resources without acquiring lock."""
         try:
             if self._session:
-                await self._session.__aexit__(None, None, None)
+                try:
+                    await self._session.__aexit__(None, None, None)
+                except Exception as exc:
+                    logger.debug("Session __aexit__ raised for '%s': %s", self.name, exc)
                 self._session = None
 
-            if hasattr(self, "_stdio_client") and self._stdio_client:
-                await self._stdio_client.__aexit__(None, None, None)
-                self._stdio_client = None
-
-            if hasattr(self, "_sse_client") and self._sse_client:
-                await self._sse_client.__aexit__(None, None, None)
-                self._sse_client = None
-
-            if (
-                hasattr(self, "_streamable_http_client")
-                and self._streamable_http_client
-            ):
-                await self._streamable_http_client.__aexit__(None, None, None)
-                self._streamable_http_client = None
-
-            if hasattr(self, "_http_client") and self._http_client:
-                await self._http_client.__aexit__(None, None, None)
-                self._http_client = None
+            # Signal all background transport tasks to disconnect and wait for them
+            for task, disconnect_event in getattr(self, "_transport_tasks", []):
+                disconnect_event.set()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as exc:
+                    logger.debug("Transport task teardown for '%s': %s", self.name, exc)
+                    task.cancel()
+            self._transport_tasks = []
 
         except Exception as e:
             logger.warning(f"Error cleaning up resources for '{self.name}': {e}")

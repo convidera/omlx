@@ -263,6 +263,19 @@ def _find_target_python() -> str:
     return sys.executable
 
 
+def _ensure_pip(python: str) -> None:
+    """Ensure pip is available in the given Python interpreter."""
+    check = subprocess.run(
+        [python, "-m", "pip", "--version"],
+        capture_output=True,
+    )
+    if check.returncode != 0:
+        subprocess.run(
+            [python, "-m", "ensurepip", "--upgrade"],
+            capture_output=True,
+        )
+
+
 def _build_sdist_wheel(pkg_name: str) -> bool:
     """Build a wheel for a sdist-only package into _wheels/.
 
@@ -270,6 +283,7 @@ def _build_sdist_wheel(pkg_name: str) -> bool:
     Returns True if the wheel was built successfully.
     """
     target_python = _find_target_python()
+    _ensure_pip(target_python)
     print(f"  Building wheel for {pkg_name} (sdist-only, using {target_python})...")
     result = subprocess.run(
         [target_python, "-m", "pip", "wheel", pkg_name, "--no-deps",
@@ -516,7 +530,7 @@ def build_venvstacks():
     # _lock_with_sdist_retry() builds them locally and retries automatically.
     print("\n  Locking environments...")
     lock_cmd = [
-        "pipx", "run", "venvstacks", "lock",
+        "uvx", "venvstacks", "lock",
         str(resolved_toml),
     ] + local_wheels_args
     if version_map:
@@ -529,7 +543,7 @@ def build_venvstacks():
     # Step 4: Build environments
     print("\n  Building environments (this may take a while)...")
     run_cmd([
-        "pipx", "run", "venvstacks", "build",
+        "uvx", "venvstacks", "build",
         str(resolved_toml),
         "--no-lock",
     ] + local_wheels_args)
@@ -540,7 +554,7 @@ def build_venvstacks():
         shutil.rmtree(EXPORT_DIR)
 
     run_cmd([
-        "pipx", "run", "venvstacks", "local-export",
+        "uvx", "venvstacks", "local-export",
         str(resolved_toml),
         "--output-dir", str(EXPORT_DIR),
     ])
@@ -976,6 +990,10 @@ def create_app_bundle():
     cli_launcher.chmod(0o755)
 
     # Create Info.plist
+    # NOTE: do NOT add LSUIElement here. Dock icon visibility is controlled
+    # at runtime via setActivationPolicy_ in app.py. Combining LSUIElement
+    # with runtime policy switching causes ControlCenter to block the
+    # NSStatusItem (menubar icon) on macOS Sonoma+. See issue #725.
     print("  Creating Info.plist...")
     info_plist = {
         "CFBundleName": APP_NAME,
@@ -988,10 +1006,17 @@ def create_app_bundle():
         "CFBundleSignature": "????",
         "CFBundleIconFile": "AppIcon",
         "LSMinimumSystemVersion": "15.0",
-        "LSUIElement": True,
+        # Xcode sets this automatically; our manual bundle was missing it.
+        # Aligns the launch metadata with native AppKit templates so tools
+        # that key off NSPrincipalClass (Accessibility enumerators among
+        # them) recognize the process as a standard NSApplication host.
+        "NSPrincipalClass": "NSApplication",
         "NSHighResolutionCapable": True,
         "LSArchitecturePriority": ["arm64"],
-        "NSHumanReadableCopyright": f"Copyright 2024 oMLX contributors. Version {VERSION}",
+        "NSHumanReadableCopyright": (
+            f"Copyright © {datetime.now().year} oMLX contributors.\n"
+            "Licensed under the Apache License 2.0."
+        ),
     }
 
     with open(contents_dir / "Info.plist", "wb") as f:
@@ -1251,6 +1276,10 @@ def main():
 
     print(f"Building {APP_NAME} v{VERSION}")
     print("=" * 50)
+
+    # Ensure pip is available in the current interpreter — uv environments
+    # don't include pip by default, but we invoke it directly in several places.
+    _ensure_pip(sys.executable)
 
     # Clean build artifacts before starting (unless dmg-only)
     if not args.dmg_only:

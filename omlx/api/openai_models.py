@@ -61,6 +61,8 @@ class Message(BaseModel):
     """
     role: str
     content: Optional[Union[str, List[ContentPart], List[dict]]] = None
+    # Reasoning/thinking content from <think> blocks (OpenAI reasoning_content field)
+    reasoning_content: Optional[str] = None
     # For assistant messages with tool calls
     tool_calls: Optional[List[dict]] = None
     # For tool response messages (role="tool")
@@ -185,6 +187,10 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # oMLX extension: when True the server executes MCP tool calls in a loop
+    # and returns the final model response. When False (default) tool_calls are
+    # returned to the client for it to handle.
+    execute_mcp_tools: bool = False
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -363,6 +369,7 @@ class ChatCompletionChunkDelta(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[dict]] = None
+    tool_call_event: Optional[dict] = None
 
 
 class ChatCompletionChunkChoice(BaseModel):

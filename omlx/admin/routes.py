@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional, List, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -125,6 +125,42 @@ class ModelSettingsRequest(BaseModel):
     reasoning_parser: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
+
+
+class CreateProfileRequest(BaseModel):
+    """Request body for creating a per-model profile."""
+    name: str
+    display_name: str
+    description: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    also_save_as_template: bool = False
+    source_template: Optional[str] = None
+
+
+class UpdateProfileRequest(BaseModel):
+    """Request body for updating/renaming a per-model profile."""
+    new_name: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
+    source_template: Optional[str] = None
+    also_save_as_template: bool = False
+
+
+class CreateTemplateRequest(BaseModel):
+    """Request body for creating a global template."""
+    name: str
+    display_name: str
+    description: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateTemplateRequest(BaseModel):
+    """Request body for updating/renaming a global template."""
+    new_name: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -236,6 +272,7 @@ class OQStartRequest(BaseModel):
     group_size: int = 64
     sensitivity_model_path: str = ""
     text_only: bool = False
+    dtype: str = "bfloat16"
 
 
 class HFUploadRequest(BaseModel):
@@ -1347,6 +1384,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
             "thinking_default": model_info.get("thinking_default"),
+            "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "last_access": model_info.get("last_access"),
         }
 
@@ -1386,6 +1424,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "is_default": settings.is_default,
                 "display_name": settings.display_name,
                 "description": settings.description,
+                "active_profile_name": settings.active_profile_name,
             }
 
         models.append(model_data)
@@ -1621,6 +1660,22 @@ async def update_model_settings(
         if request.is_default and server_state:
             server_state.default_model = model_id
 
+    # If an active profile was set, clear it when the user's save diverges
+    # from the profile's stored values.
+    if current_settings.active_profile_name:
+        profile = settings_manager.get_profile(
+            model_id, current_settings.active_profile_name
+        )
+        if profile is None:
+            current_settings.active_profile_name = None
+        else:
+            profile_settings = profile.get("settings", {}) or {}
+            candidate = current_settings.to_dict()
+            for key, expected in profile_settings.items():
+                if candidate.get(key) != expected:
+                    current_settings.active_profile_name = None
+                    break
+
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
 
@@ -1648,6 +1703,221 @@ async def update_model_settings(
         "engine_type": entry.engine_type,
         "requires_reload": requires_reload,
     }
+
+
+# =============================================================================
+# Profile & Template endpoints
+# =============================================================================
+
+
+def _require_settings_manager():
+    mgr = _get_settings_manager()
+    if mgr is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    return mgr
+
+
+def _require_model(model_id: str):
+    pool = _get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    return entry
+
+
+@router.get("/api/models/{model_id}/profiles")
+async def list_model_profiles(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    return {"profiles": mgr.list_profiles(model_id)}
+
+
+@router.post("/api/models/{model_id}/profiles")
+async def create_model_profile(
+    model_id: str,
+    request: CreateProfileRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    try:
+        profile = mgr.save_profile(
+            model_id=model_id,
+            name=request.name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings or {},
+            source_template=request.source_template,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    if request.also_save_as_template:
+        try:
+            mgr.upsert_template(
+                name=request.name,
+                display_name=request.display_name,
+                description=request.description,
+                settings=filter_universal_fields(request.settings or {}),
+            )
+        except InvalidProfileNameError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return {"profile": profile}
+
+
+@router.put("/api/models/{model_id}/profiles/{name}")
+async def update_model_profile(
+    model_id: str,
+    name: str,
+    request: UpdateProfileRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    try:
+        updated = mgr.update_profile(
+            model_id=model_id,
+            name=name,
+            new_name=request.new_name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings,
+            source_template=request.source_template,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+
+    if request.also_save_as_template and request.settings is not None:
+        try:
+            mgr.upsert_template(
+                name=updated["name"],
+                display_name=updated["display_name"],
+                description=updated.get("description"),
+                settings=filter_universal_fields(request.settings),
+            )
+        except InvalidProfileNameError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return {"profile": updated}
+
+
+@router.delete("/api/models/{model_id}/profiles/{name}")
+async def delete_model_profile(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    if not mgr.delete_profile(model_id, name):
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    return {"deleted": True, "name": name}
+
+
+@router.post("/api/models/{model_id}/profiles/{name}/apply")
+async def apply_model_profile(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    _require_model(model_id)
+    applied = mgr.apply_profile(model_id, name)
+    if applied is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    return {"model_id": model_id, "settings": applied.to_dict()}
+
+
+@router.get("/api/profile-fields")
+async def get_profile_fields(is_admin: bool = Depends(require_admin)):
+    from ..model_profiles import (
+        UNIVERSAL_PROFILE_FIELDS,
+        MODEL_SPECIFIC_PROFILE_FIELDS,
+    )
+
+    return {
+        "universal": list(UNIVERSAL_PROFILE_FIELDS),
+        "model_specific": list(MODEL_SPECIFIC_PROFILE_FIELDS),
+    }
+
+
+@router.get("/api/profile-templates")
+async def list_templates(is_admin: bool = Depends(require_admin)):
+    mgr = _require_settings_manager()
+    return {"templates": mgr.list_templates()}
+
+
+@router.post("/api/profile-templates")
+async def create_template(
+    request: CreateTemplateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError
+
+    mgr = _require_settings_manager()
+    try:
+        tmpl = mgr.save_template(
+            name=request.name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings or {},
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"template": tmpl}
+
+
+@router.put("/api/profile-templates/{name}")
+async def update_template(
+    name: str,
+    request: UpdateTemplateRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    from ..model_profiles import InvalidProfileNameError
+
+    mgr = _require_settings_manager()
+    try:
+        updated = mgr.update_template(
+            name=name,
+            new_name=request.new_name,
+            display_name=request.display_name,
+            description=request.description,
+            settings=request.settings,
+        )
+    except InvalidProfileNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
+    return {"template": updated}
+
+
+@router.delete("/api/profile-templates/{name}")
+async def delete_template(
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    if not mgr.delete_template(name):
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
+    return {"deleted": True, "name": name}
 
 
 @router.get("/api/models/{model_id}/generation_config")
@@ -4130,6 +4400,11 @@ async def start_oq_quantization(
             status_code=400,
             detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
         )
+    if request.dtype not in ("bfloat16", "float16"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
+        )
     try:
         task = await _oq_manager.start_quantization(
             model_path=request.model_path,
@@ -4137,6 +4412,7 @@ async def start_oq_quantization(
             group_size=request.group_size,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
+            dtype=request.dtype,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
@@ -4288,3 +4564,389 @@ async def remove_upload_task(
             status_code=404, detail="Task not found or still active"
         )
     return {"success": True}
+
+
+# =============================================================================
+# MCP Server Management Routes
+# =============================================================================
+
+# In-memory store for pending OAuth PKCE sessions, keyed by state parameter
+_mcp_oauth_sessions: Dict[str, Dict] = {}
+
+
+def _get_mcp_config_path() -> Optional[Path]:
+    """Return the MCP config file path currently in use (or None)."""
+    from ..mcp.config import _find_config_file
+    try:
+        return _find_config_file()
+    except Exception:
+        return None
+
+
+def _read_mcp_config_file() -> Optional[Dict]:
+    """Read and parse the MCP config JSON file."""
+    path = _get_mcp_config_path()
+    if path is None:
+        return None
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return None
+
+
+def _write_mcp_config_file(config_data: Dict) -> Path:
+    """Write config_data to the MCP config file, creating it if needed."""
+    path = _get_mcp_config_path()
+    if path is None:
+        path = Path("./mcp.json")
+    Path(path).write_text(json.dumps(config_data, indent=2))
+    return path
+
+
+def _mcp_oauth_result_html(success: bool, message: str) -> str:
+    icon = "✓" if success else "✗"
+    color = "#16a34a" if success else "#dc2626"
+    bg = "#f0fdf4" if success else "#fef2f2"
+    js_success = "true" if success else "false"
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<title>oMLX – MCP Authentication</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;
+  align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f9fafb;}}
+.card{{background:white;border-radius:16px;padding:2.5rem 3rem;text-align:center;
+  box-shadow:0 1px 4px rgba(0,0,0,.1);max-width:420px;width:90%;}}
+.icon{{width:52px;height:52px;border-radius:50%;background:{bg};color:{color};
+  font-size:1.5rem;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;}}
+h2{{color:#111827;margin:0 0 .5rem;font-size:1.125rem;font-weight:600;}}
+p{{color:#6b7280;margin:0;font-size:.875rem;line-height:1.5;}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">{icon}</div>
+  <h2>{'Authentication Complete' if success else 'Authentication Failed'}</h2>
+  <p>{message}</p>
+</div>
+<script>
+try {{
+  if (window.opener) {{
+    window.opener.postMessage(
+      JSON.stringify({{type:'mcp_oauth_complete',success:{js_success}}}), '*'
+    );
+    setTimeout(() => window.close(), 1500);
+  }}
+}} catch(e) {{}}
+</script>
+</body>
+</html>"""
+
+
+@router.get("/api/mcp/servers")
+async def get_mcp_servers(is_admin: bool = Depends(require_admin)):
+    """List all configured MCP servers with connection status and auth info."""
+    from ..server import _server_state
+    from ..mcp.oauth import MCPOAuthManager
+
+    if _server_state.mcp_manager is None:
+        return {"servers": [], "config_path": None, "available": False}
+
+    oauth_manager = MCPOAuthManager()
+    statuses = _server_state.mcp_manager.get_server_status()
+
+    result = []
+    for status in statuses:
+        info = status.to_dict()
+        cfg = _server_state.mcp_manager.config.servers.get(status.name)
+        if cfg:
+            info["enabled"] = cfg.enabled
+            info["has_auth"] = cfg.auth is not None
+            if cfg.auth:
+                info["auth_info"] = oauth_manager.get_token_info(status.name)
+        # Include tool list for connected servers
+        client = _server_state.mcp_manager._clients.get(status.name)
+        if client and client.tools:
+            info["tools"] = [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "param_count": len((t.input_schema or {}).get("properties", {})),
+                }
+                for t in client.tools
+            ]
+        else:
+            info["tools"] = []
+        result.append(info)
+
+    config_path = _get_mcp_config_path()
+    return {
+        "servers": result,
+        "config_path": str(config_path) if config_path else None,
+        "available": True,
+        "max_tool_calls": _server_state.mcp_manager.config.max_tool_calls,
+    }
+
+
+@router.post("/api/mcp/servers/{name}/reconnect")
+async def reconnect_mcp_server(name: str, is_admin: bool = Depends(require_admin)):
+    """Reconnect a specific MCP server."""
+    from ..server import _server_state
+    if _server_state.mcp_manager is None:
+        raise HTTPException(status_code=503, detail="MCP not initialized")
+    await _server_state.mcp_manager.reconnect(name)
+    return {"success": True}
+
+
+@router.post("/api/mcp/servers/{name}/authenticate")
+async def start_mcp_authenticate(name: str, request: Request, is_admin: bool = Depends(require_admin)):
+    """Start an OAuth PKCE flow for the given MCP server.
+
+    Returns ``{auth_url}`` that the client should open in a new browser window.
+    When the OAuth provider redirects back to the callback URL the token is
+    stored and the popup notifies the opener via postMessage.
+    """
+    from ..server import _server_state
+    from ..mcp.oauth import (
+        _discover_oauth_metadata,
+        _generate_code_challenge,
+        _generate_code_verifier,
+        _register_dynamic_client,
+    )
+    from urllib.parse import urlencode
+
+    if _server_state.mcp_manager is None:
+        raise HTTPException(status_code=503, detail="MCP not initialized")
+
+    cfg = _server_state.mcp_manager.config.servers.get(name)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
+    if cfg.auth is None:
+        raise HTTPException(status_code=400, detail=f"Server '{name}' has no OAuth configuration")
+
+    auth_config = cfg.auth
+    auth_url = auth_config.auth_url
+    token_url = auth_config.token_url
+    client_id = auth_config.client_id
+    registered_client_id: Optional[str] = None
+
+    base_url = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base_url}/admin/api/mcp/oauth/callback"
+
+    if not auth_url or not token_url or not client_id:
+        if not cfg.url:
+            raise HTTPException(
+                status_code=400,
+                detail="Server has no URL for OAuth metadata discovery. "
+                "Set auth_url, token_url, and client_id explicitly.",
+            )
+        try:
+            metadata = await _discover_oauth_metadata(cfg.url)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"OAuth discovery failed: {exc}")
+        if not auth_url:
+            auth_url = metadata.get("authorization_endpoint", "")
+        if not token_url:
+            token_url = metadata.get("token_endpoint", "")
+        if not client_id:
+            # Reuse a previously registered client_id if available (avoid redundant DCR)
+            from ..mcp.token_store import TokenStore
+            existing_token = TokenStore(cfg.auth.token_store if cfg.auth else None).load(name)
+            if existing_token and existing_token.registered_client_id:
+                client_id = existing_token.registered_client_id
+                registered_client_id = client_id
+            else:
+                reg_endpoint = metadata.get("registration_endpoint")
+                if not reg_endpoint:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="OAuth server does not advertise a registration_endpoint. "
+                        "Set client_id explicitly in the server auth config.",
+                    )
+                try:
+                    client_id = await _register_dynamic_client(reg_endpoint, redirect_uri)
+                    registered_client_id = client_id
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"Dynamic Client Registration failed: {exc}")
+
+    code_verifier = _generate_code_verifier()
+    code_challenge = _generate_code_challenge(code_verifier)
+    state = secrets.token_urlsafe(16)
+
+    params: Dict[str, str] = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    if auth_config.scopes:
+        params["scope"] = " ".join(auth_config.scopes)
+    if auth_config.audience:
+        params["audience"] = auth_config.audience
+
+    _mcp_oauth_sessions[state] = {
+        "server_name": name,
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri,
+        "token_url": token_url,
+        "client_id": client_id,
+        "registered_client_id": registered_client_id,
+        "created_at": time.time(),
+    }
+
+    return {"auth_url": f"{auth_url}?{urlencode(params)}"}
+
+
+@router.get("/api/mcp/oauth/callback", response_class=HTMLResponse)
+async def mcp_oauth_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    """Public OAuth callback endpoint — no session auth required.
+
+    The OAuth provider redirects the user's browser here after authorization.
+    """
+    import httpx
+    from ..mcp.token_store import TokenData, TokenStore
+
+    if error:
+        desc = f" — {error_description}" if error_description else ""
+        return HTMLResponse(_mcp_oauth_result_html(False, f"OAuth error: {error}{desc}"))
+
+    if not code or not state:
+        return HTMLResponse(_mcp_oauth_result_html(False, "Missing authorization code or state parameter."))
+
+    session = _mcp_oauth_sessions.pop(state, None)
+    if session is None:
+        return HTMLResponse(_mcp_oauth_result_html(False, "Invalid or expired OAuth session. Please try again."))
+
+    if time.time() - session["created_at"] > 600:
+        return HTMLResponse(_mcp_oauth_result_html(False, "OAuth session expired (>10 min). Please try again."))
+
+    try:
+        payload = {
+            "grant_type": "authorization_code",
+            "client_id": session["client_id"],
+            "code": code,
+            "redirect_uri": session["redirect_uri"],
+            "code_verifier": session["code_verifier"],
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                session["token_url"],
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            token_resp = resp.json()
+
+        expires_in = token_resp.get("expires_in")
+        token = TokenData(
+            access_token=token_resp["access_token"],
+            token_type=token_resp.get("token_type", "Bearer"),
+            refresh_token=token_resp.get("refresh_token"),
+            expires_at=(time.time() + expires_in) if expires_in is not None else None,
+            scope=token_resp.get("scope"),
+        )
+        if session.get("registered_client_id"):
+            token.registered_client_id = session["registered_client_id"]
+        if session.get("token_url"):
+            token.token_url = session["token_url"]
+
+        TokenStore().save(session["server_name"], token)
+        logger.info("MCP OAuth complete for server '%s'", session["server_name"])
+
+        from ..server import _server_state
+        if _server_state.mcp_manager is not None:
+            asyncio.create_task(_server_state.mcp_manager.reconnect(session["server_name"]))
+
+        return HTMLResponse(_mcp_oauth_result_html(True, "Authenticated successfully. You may close this window."))
+    except Exception as exc:
+        logger.error("MCP OAuth token exchange failed: %s", exc)
+        return HTMLResponse(_mcp_oauth_result_html(False, f"Token exchange failed: {exc}"))
+
+
+@router.post("/api/mcp/servers/{name}/logout")
+async def logout_mcp_server(name: str, is_admin: bool = Depends(require_admin)):
+    """Remove stored OAuth tokens for the given MCP server."""
+    from ..mcp.token_store import TokenStore
+    TokenStore().delete(name)
+    return {"success": True}
+
+
+@router.get("/api/mcp/config")
+async def get_mcp_config_route(is_admin: bool = Depends(require_admin)):
+    """Return the raw MCP config JSON and its file path."""
+    config_data = _read_mcp_config_file()
+    path = _get_mcp_config_path()
+    if config_data is None:
+        config_data = {"servers": {}, "max_tool_calls": 10, "default_timeout": 30.0}
+    return {"config": config_data, "path": str(path) if path else None}
+
+
+@router.post("/api/mcp/config")
+async def save_mcp_config_route(request: Request, is_admin: bool = Depends(require_admin)):
+    """Validate and persist the MCP config JSON to disk."""
+    from ..mcp.config import validate_config
+    body = await request.json()
+    config_data = body.get("config")
+    if config_data is None:
+        raise HTTPException(status_code=400, detail="Missing 'config' field")
+    try:
+        validate_config(config_data)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}")
+    try:
+        path = _write_mcp_config_file(config_data)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write config: {exc}")
+    return {"success": True, "path": str(path)}
+
+
+@router.post("/api/mcp/reload")
+async def reload_mcp_config(is_admin: bool = Depends(require_admin)):
+    """Stop the current MCP manager, reload config from disk, and restart.
+
+    This lets config changes (new servers, edited URLs, etc.) take effect
+    without restarting the whole server process.
+    """
+    from ..server import _server_state
+    from ..mcp import MCPClientManager, ToolExecutor, load_mcp_config
+
+    config_path = _get_mcp_config_path()
+    if config_path is None:
+        raise HTTPException(status_code=404, detail="No MCP config file found")
+
+    try:
+        new_config = load_mcp_config(config_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid config: {exc}")
+
+    # Stop old manager gracefully
+    if _server_state.mcp_manager is not None:
+        try:
+            await _server_state.mcp_manager.stop()
+        except Exception:
+            pass
+        _server_state.mcp_manager = None
+        _server_state.mcp_executor = None
+
+    # Start fresh
+    try:
+        _server_state.mcp_manager = MCPClientManager(new_config)
+        await _server_state.mcp_manager.start()
+        _server_state.mcp_executor = ToolExecutor(_server_state.mcp_manager)
+    except Exception as exc:
+        logger.error("MCP reload failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to start MCP: {exc}")
+
+    tool_count = len(_server_state.mcp_manager.get_all_tools())
+    server_count = len(new_config.servers)
+    logger.info("MCP config reloaded: %d servers, %d tools", server_count, tool_count)
+    return {"success": True, "servers": server_count, "tools": tool_count}

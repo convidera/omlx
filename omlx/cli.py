@@ -273,6 +273,118 @@ def serve_command(args):
     )
 
 
+def mcp_command(args):
+    """Handle 'omlx mcp' subcommands (login, logout, status)."""
+    import asyncio
+    import sys
+
+    sub = args.mcp_subcommand
+
+    if sub == "status":
+        _mcp_status(args)
+    elif sub == "login":
+        asyncio.run(_mcp_login(args))
+    elif sub == "logout":
+        _mcp_logout(args)
+    else:
+        # No subcommand given — print help.
+        print("Usage: omlx mcp {login,logout,status} <server>")
+        sys.exit(1)
+
+
+def _mcp_status(args) -> None:
+    """Print OAuth auth status for MCP servers."""
+    from .mcp.config import load_mcp_config
+    from .mcp.oauth import MCPOAuthManager
+    from .settings import GlobalSettings
+
+    settings = GlobalSettings.load()
+    mcp_config = args.mcp_config or settings.mcp.config_path
+    config = load_mcp_config(mcp_config)
+    if not config.servers:
+        print("No MCP servers configured.")
+        return
+
+    manager = MCPOAuthManager()
+    for name, server in config.servers.items():
+        if not server.auth:
+            print(f"  {name}: no OAuth configured")
+            continue
+        info = manager.get_token_info(name)
+        if info is None:
+            print(f"  {name}: not authenticated")
+        elif info.get("is_expired"):
+            print(f"  {name}: token expired (run 'omlx mcp login {name}' to re-authenticate)")
+        else:
+            scope = info.get("scope") or ""
+            expires_at = info.get("expires_at")
+            expiry_note = ""
+            if expires_at:
+                import time
+                remaining = int(expires_at - time.time())
+                expiry_note = f", expires in {remaining}s"
+            print(f"  {name}: authenticated (scope={scope!r}{expiry_note})")
+
+
+async def _mcp_login(args) -> None:
+    """Perform OAuth login for an MCP server."""
+    import sys
+
+    from .mcp.config import load_mcp_config
+    from .mcp.oauth import MCPOAuthManager
+    from .settings import GlobalSettings
+
+    server_name: str = args.server
+    flow: str = args.flow
+
+    settings = GlobalSettings.load()
+    mcp_config = args.mcp_config or settings.mcp.config_path
+    config = load_mcp_config(mcp_config)
+
+    if server_name not in config.servers:
+        print(f"Unknown MCP server: '{server_name}'")
+        print(f"Configured servers: {', '.join(config.servers) or '(none)'}")
+        sys.exit(1)
+
+    server = config.servers[server_name]
+    if not server.auth:
+        print(
+            f"MCP server '{server_name}' has no OAuth configuration. "
+            "Add an 'auth' block to its config entry."
+        )
+        sys.exit(1)
+
+    manager = MCPOAuthManager()
+    try:
+        token = await manager.login(server_name, server.auth, flow=flow, server_url=server.url)
+        scope = token.scope or ""
+        print(f"\nAuthentication successful for '{server_name}' (scope={scope!r})")
+    except Exception as exc:
+        print(f"\nAuthentication failed for '{server_name}': {exc}")
+        sys.exit(1)
+
+
+def _mcp_logout(args) -> None:
+    """Remove stored OAuth tokens for an MCP server."""
+    import sys
+
+    from .mcp.config import load_mcp_config
+    from .mcp.oauth import MCPOAuthManager
+    from .settings import GlobalSettings
+
+    server_name: str = args.server
+
+    settings = GlobalSettings.load()
+    mcp_config = args.mcp_config or settings.mcp.config_path
+    config = load_mcp_config(mcp_config)
+    if server_name not in config.servers:
+        print(f"Unknown MCP server: '{server_name}'")
+        sys.exit(1)
+
+    manager = MCPOAuthManager()
+    manager.logout(server_name)
+    print(f"Logged out from '{server_name}': stored tokens removed.")
+
 
 def launch_command(args):
     """Launch an external tool integrated with oMLX."""
@@ -392,6 +504,99 @@ def launch_command(args):
         max_tokens=max_tokens,
         model_type=model_type,
     )
+
+
+def diagnose_menubar() -> int:
+    """Diagnose why the oMLX menubar icon might be missing.
+
+    Reports macOS version, app install path, running menubar process, and the
+    most recent visibility warning from the log. Prints manual recovery steps
+    since Tahoe's ControlCenter doesn't expose a public API to re-enable a
+    hidden status item.
+    """
+    import platform
+    import subprocess
+    from pathlib import Path
+
+    print("oMLX menubar diagnostics")
+    print("=" * 40)
+
+    mac_ver = platform.mac_ver()[0] or "unknown"
+    print(f"macOS:          {mac_ver}")
+    print(f"Bundle ID:      com.omlx.app")
+
+    app_path = Path("/Applications/oMLX.app")
+    print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
+
+    try:
+        res = subprocess.run(
+            ["pgrep", "-af", "omlx_app"],
+            capture_output=True, text=True, timeout=5,
+        )
+        running = bool(res.stdout.strip())
+        print(f"Menubar app:    {'running' if running else 'NOT running'}")
+        if running:
+            first_line = res.stdout.strip().splitlines()[0]
+            pid = first_line.split()[0] if first_line else "?"
+            print(f"PID:            {pid}")
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        print(f"Menubar app:    check failed ({e})")
+
+    log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
+    # menubar.log captures the visibility probe (frame + isVisible);
+    # server.log may carry fallback warnings for older builds.
+    log_candidates = [log_dir / "menubar.log", log_dir / "server.log"]
+    print(f"Log dir:        {log_dir}")
+
+    hits: list[tuple[str, str]] = []
+    for path in log_candidates:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 131072))
+                tail = f.read().decode("utf-8", errors="replace")
+        except OSError as e:
+            print(f"Could not read {path.name}: {e}")
+            continue
+        for ln in tail.splitlines():
+            if (
+                "menubar visibility probe" in ln
+                or "NSStatusItem" in ln
+                or "ControlCenter" in ln
+                or "Menu Bar" in ln
+            ):
+                hits.append((path.name, ln))
+
+    if hits:
+        print("\nRecent visibility log entries (last 10):")
+        for src, ln in hits[-10:]:
+            print(f"  [{src}] {ln}")
+    else:
+        print("\nNo visibility log entries found (app may not have probed yet).")
+
+    print()
+    print("If the icon is missing on macOS Tahoe (26.x):")
+    print("  1. Open System Settings > Menu Bar")
+    print("     open 'x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar'")
+    print("  2. Find 'oMLX' and set it to 'Show in Menu Bar'")
+    print("  3. If oMLX isn't in the list, quit the menubar app and relaunch oMLX.app")
+    print()
+    print("Note: Apple's sandbox policy prevents third-party apps from")
+    print("programmatically re-enabling their own menubar visibility on Tahoe.")
+    return 0
+
+
+def diagnose_command(args) -> int:
+    """Dispatch 'omlx diagnose <target>' to the appropriate subcommand."""
+    target = getattr(args, "target", None)
+    if target == "menubar":
+        return diagnose_menubar()
+    print(f"Unknown diagnose target: {target}")
+    print("Available: menubar")
+    return 1
 
 
 def main():
@@ -609,12 +814,83 @@ Example directory structure:
         help="OpenClaw tools profile (default: coding)",
     )
 
+    # Diagnose command
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help="Diagnose installation or runtime issues",
+        description="Run diagnostic checks and print recovery steps.",
+    )
+    diagnose_parser.add_argument(
+        "target",
+        type=str,
+        choices=["menubar"],
+        help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
+    )
+
+    # MCP command (login / logout / status)
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="Manage MCP server OAuth authentication",
+        description="Authenticate with OAuth-protected MCP servers.",
+    )
+    mcp_parser.add_argument(
+        "--mcp-config",
+        type=str,
+        default=None,
+        help="Path to MCP configuration file (default: auto-detected)",
+    )
+    mcp_subparsers = mcp_parser.add_subparsers(
+        dest="mcp_subcommand", help="MCP auth commands"
+    )
+
+    # omlx mcp status
+    mcp_status_parser = mcp_subparsers.add_parser(
+        "status",
+        help="Show OAuth authentication status for all configured MCP servers",
+    )
+
+    # omlx mcp login <server>
+    mcp_login_parser = mcp_subparsers.add_parser(
+        "login",
+        help="Authenticate with an OAuth-protected MCP server",
+    )
+    mcp_login_parser.add_argument(
+        "server",
+        type=str,
+        help="MCP server name as defined in the config file",
+    )
+    mcp_login_parser.add_argument(
+        "--flow",
+        type=str,
+        default="pkce",
+        choices=["pkce", "device"],
+        help=(
+            "OAuth flow to use: 'pkce' opens a browser (default), "
+            "'device' prints a code for headless environments"
+        ),
+    )
+
+    # omlx mcp logout <server>
+    mcp_logout_parser = mcp_subparsers.add_parser(
+        "logout",
+        help="Remove stored OAuth tokens for an MCP server",
+    )
+    mcp_logout_parser.add_argument(
+        "server",
+        type=str,
+        help="MCP server name as defined in the config file",
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
         serve_command(args)
     elif args.command == "launch":
         launch_command(args)
+    elif args.command == "diagnose":
+        sys.exit(diagnose_command(args))
+    elif args.command == "mcp":
+        mcp_command(args)
     else:
         parser.print_help()
         sys.exit(1)

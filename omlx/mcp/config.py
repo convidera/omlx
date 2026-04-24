@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from .types import MCPConfig, MCPServerConfig
+from .types import MCPAuthConfig, MCPConfig, MCPServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,18 @@ def validate_config(data: Dict[str, Any]) -> MCPConfig:
             if isinstance(server_data, dict):
                 server_data = server_data.copy()
                 server_data["name"] = name
+                # Strip documentation-only keys that start with '_'
+                for key in [k for k in list(server_data) if k.startswith("_")]:
+                    server_data.pop(key)
+                # Parse optional 'auth' block into MCPAuthConfig
+                auth_raw = server_data.pop("auth", None)
+                if auth_raw is not None:
+                    if not isinstance(auth_raw, dict):
+                        raise ValueError(f"Server '{name}': 'auth' must be a dictionary")
+                    try:
+                        server_data["auth"] = MCPAuthConfig(**auth_raw)
+                    except TypeError as exc:
+                        raise ValueError(f"Invalid auth config for server '{name}': {exc}")
                 servers[name] = MCPServerConfig(**server_data)
             else:
                 raise ValueError(f"Server '{name}' config must be a dictionary")
@@ -175,6 +187,37 @@ def create_example_config() -> str:
                 "command": "uvx",
                 "args": ["mcp-server-sqlite", "--db-path", "data.db"],
                 "enabled": True
+            },
+            "notion": {
+                "_comment": (
+                    "Notion remote MCP — uses OAuth 2.1 with Dynamic Client "
+                    "Registration (no client_id needed). "
+                    "Run: omlx mcp login notion"
+                ),
+                "transport": "streamable-http",
+                "url": "https://mcp.notion.com/mcp",
+                "enabled": False,
+                "timeout": 60,
+                "auth": {
+                    "type": "oauth2",
+                }
+            },
+            "notion-oauth-app": {
+                "_comment": (
+                    "Notion public OAuth app "
+                    "- for developers with a registered OAuth application (client_id required)"
+                ),
+                "transport": "streamable-http",
+                "url": "https://mcp.notion.com/mcp",
+                "enabled": False,
+                "timeout": 60,
+                "auth": {
+                    "type": "oauth2",
+                    "client_id": "YOUR_NOTION_OAUTH_CLIENT_ID",
+                    "auth_url": "https://api.notion.com/v1/oauth/authorize",
+                    "token_url": "https://api.notion.com/v1/oauth/token",
+                    "scopes": ["read_content", "update_content"]
+                }
             }
         },
         "max_tool_calls": 10,
