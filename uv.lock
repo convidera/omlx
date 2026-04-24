@@ -15,7 +15,7 @@ resolution-markers = [
 ]
 
 [manifest]
-overrides = [{ name = "mlx-lm", git = "https://github.com/ml-explore/mlx-lm?rev=dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7" }]
+overrides = [{ name = "mlx-lm", git = "https://github.com/ml-explore/mlx-lm?rev=a40173094136fbcbfb41966889a22530c83bd86e" }]
 
 [[package]]
 name = "addict"
@@ -917,8 +917,8 @@ wheels = [
 
 [[package]]
 name = "dflash-mlx"
-version = "0.1.0"
-source = { git = "https://github.com/jundot/dflash-mlx?rev=8e1df22#8e1df22796e3918a4812bc0b2a9fe8f13ac476c9" }
+version = "0.1.3"
+source = { git = "https://github.com/jundot/dflash-mlx?rev=814c4a1#814c4a1203744c96ee3aa00802cf495abdf77a59" }
 dependencies = [
     { name = "mlx" },
     { name = "mlx-lm" },
@@ -1953,8 +1953,8 @@ dependencies = [
 
 [[package]]
 name = "mlx-lm"
-version = "0.31.2"
-source = { git = "https://github.com/ml-explore/mlx-lm?rev=dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7#dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7" }
+version = "0.31.3"
+source = { git = "https://github.com/ml-explore/mlx-lm?rev=a40173094136fbcbfb41966889a22530c83bd86e#a40173094136fbcbfb41966889a22530c83bd86e" }
 dependencies = [
     { name = "jinja2" },
     { name = "mlx", marker = "sys_platform == 'darwin'" },
@@ -2832,7 +2832,7 @@ dev = [
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
     { name = "ddgs", specifier = ">=9.12.1" },
-    { name = "dflash-mlx", git = "https://github.com/jundot/dflash-mlx?rev=8e1df22" },
+    { name = "dflash-mlx", git = "https://github.com/jundot/dflash-mlx?rev=814c4a1" },
     { name = "fastapi", specifier = ">=0.108.0" },
     { name = "huggingface-hub", specifier = ">=0.23.0" },
     { name = "itsdangerous", specifier = ">=2.0" },
@@ -2843,7 +2843,7 @@ requires-dist = [
     { name = "mlx", specifier = ">=0.31.1" },
     { name = "mlx-audio", extras = ["sts", "stt", "tts"], marker = "extra == 'audio'", git = "https://github.com/Blaizzy/mlx-audio?rev=51753266e0a4f766fd5e6fbc46652224efc23981" },
     { name = "mlx-embeddings", git = "https://github.com/Blaizzy/mlx-embeddings?rev=32981fa4e8064ed664b52071789dd18271fe4206" },
-    { name = "mlx-lm", git = "https://github.com/ml-explore/mlx-lm?rev=dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7" },
+    { name = "mlx-lm", git = "https://github.com/ml-explore/mlx-lm?rev=a40173094136fbcbfb41966889a22530c83bd86e" },
     { name = "mlx-vlm", git = "https://github.com/Blaizzy/mlx-vlm?rev=3472132fe6ee7beeae2c2fc35923eaed2e734b3d" },
     { name = "modelscope", marker = "extra == 'modelscope'", specifier = ">=1.10.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },

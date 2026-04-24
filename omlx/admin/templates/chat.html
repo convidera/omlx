@@ -554,6 +554,18 @@
                 </div>
             </div>
 
+            <!-- Tools toggle -->
+            <button @click="toolsEnabled = !toolsEnabled"
+                    x-show="mcpTools.length > 0"
+                    x-cloak
+                    class="p-2 hover:bg-surface-muted rounded-lg relative"
+                    :style="toolsEnabled ? 'color: var(--text-primary);' : 'color: var(--text-tertiary);'"
+                    :title="toolsEnabled ? window.t('chat.tools_enabled') : window.t('chat.tools_disabled')">
+                <i data-lucide="wrench" class="w-5 h-5"></i>
+                <span x-show="!toolsEnabled"
+                      class="absolute top-1 right-1 w-2 h-2 bg-surface-muted rounded-full border border-line"></span>
+            </button>
+
             <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
                     class="p-2 hover:bg-surface-muted rounded-lg relative"
                     style="color: var(--text-primary);"
@@ -1008,6 +1020,7 @@
             _toolTimers: {},             // { toolName: Date.now() } per-tool execution start
 
             // MCP tools & prefill polling
+            toolsEnabled: true,          // whether to send MCP tools and execute tool calls
             mcpTools: [],                // OpenAI-format tool definitions loaded from /v1/mcp/tools
             _prefillInterval: null,      // setInterval handle for pre-generation polling
 
@@ -1533,7 +1546,8 @@
                             messages: messagesForApi,
                             stream: true,
                             stream_options: { include_usage: true },
-                            ...(this.mcpTools.length > 0 && { tools: this.mcpTools })
+                            execute_mcp_tools: this.toolsEnabled,
+                            ...(this.toolsEnabled && this.mcpTools.length > 0 && { tools: this.mcpTools })
                         }),
                         signal: this.abortController.signal
                     });

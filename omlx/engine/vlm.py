@@ -434,9 +434,6 @@ class VLMBatchedEngine(BaseEngine):
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")
 
-        # Inject mlx-lm tool calling support into VLM tokenizer
-        self._inject_tool_calling(self._tokenizer)
-
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
@@ -459,11 +456,6 @@ class VLMBatchedEngine(BaseEngine):
         self._tokenizer = None
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
-
-    def _inject_tool_calling(self, tokenizer) -> None:
-        """Inject tool calling attributes into VLM tokenizer."""
-        from ..utils.tokenizer import inject_tool_calling
-        inject_tool_calling(tokenizer)
 
     @staticmethod
     def _count_content_parts(content: Any, part_types: set[str]) -> int:

@@ -1987,9 +1987,9 @@ async def create_chat_completion(
         if json_instruction:
             messages = _inject_json_instruction(messages, json_instruction)
 
-    # Merge MCP tools with user-provided tools
+    # Merge MCP tools with user-provided tools (only when tool calling is enabled)
     effective_tools = request.tools
-    if _server_state.mcp_manager:
+    if _server_state.mcp_manager and request.execute_mcp_tools:
         # Convert Pydantic ToolDefinition models to dicts for merge_tools
         user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
         effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)
